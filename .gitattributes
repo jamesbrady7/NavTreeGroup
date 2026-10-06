@@ -1,0 +1,19 @@
+# 统一用 LF 入库(仓库内所有源文件实测均为 LF、无 BOM)。
+# 本仓库已设 core.autocrlf=false;这份声明是给其他克隆者的兜底,
+# 避免"某台机器 autocrlf=true"把整个仓库的行尾改写、污染 blame 与 diff。
+* text=auto eol=lf
+
+# 二进制文件别当文本处理
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.pdb binary
+
+# Windows 下必须保持 CRLF 的脚本类文件(目前没有,占位以备将来)
+*.bat text eol=crlf
+*.cmd text eol=crlf
