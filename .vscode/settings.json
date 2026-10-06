@@ -1,0 +1,31 @@
+{
+    // ═══ 工作区设置(VSCode 的 .vscode/*.json 是 JSONC,注释合法) ═══
+
+    // ── 智能提示 ──
+    // IntelliSense 数据源交给 CMake Tools:它从 build 目录读取每个源文件
+    // 真实的编译参数(include/宏/语言标准),比手写 c_cpp_properties 精确
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+
+    // ── CMake Tools 行为 ──
+    // 打开工程时若没有 build 缓存则自动 configure 一次
+    "cmake.configureOnOpen": true,
+    // 固定 VS2019 生成器 + x64,与本机 Qt 5.15.2 msvc2019_64 ABI 精确匹配
+    "cmake.generator": "Visual Studio 16 2019",
+    "cmake.platform": "x64",
+    // configure 时注入 Qt 路径,find_package(Qt5) 靠它定位
+    "cmake.configureEnvironment": {
+        "CMAKE_PREFIX_PATH": "D:/Qt/5.15.2/msvc2019_64"
+    },
+
+    // ── 编码 ──
+    // 源码统一 UTF-8(配合 CMakeLists 的 /utf-8,中文注释/输出不乱码)
+    "files.encoding": "utf8",
+
+    // ── 降噪:构建产物不进搜索/资源管理器 ──
+    "search.exclude": {
+        "**/build": true
+    },
+    "files.exclude": {
+        "**/*.user": true
+    }
+}

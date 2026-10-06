@@ -1,0 +1,8 @@
+{
+    // ═══ 插件推荐:打开工程时 VSCode 右下角自动提示安装 ═══
+    "recommendations": [
+        "ms-vscode.cpptools",      // 必装:cppvsdbg 调试器 + IntelliSense 兜底
+        "ms-vscode.cmake-tools",   // 必装:接管 configure/build,提供最精确的 IntelliSense
+        "twxs.cmake"               // 可选:CMakeLists.txt 语法高亮
+    ]
+}

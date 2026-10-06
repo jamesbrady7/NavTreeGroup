@@ -1,0 +1,98 @@
+{
+    // ═══ 构建任务:Ctrl+Shift+B 触发默认任务(Build Release) ═══
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // 手动任务:首次使用或 CMakeLists 大改后跑一次,生成 build 缓存
+            // (VS 生成器自动探测 MSVC 编译器,无需先跑 vcvars)
+            "label": "CMake Configure",
+            "type": "shell",
+            "command": "D:/CMAKE/bin/cmake.exe",
+            "args": [
+                "-S", ".", "-B", "build",
+                "-G", "Visual Studio 16 2019", "-A", "x64"
+            ],
+            "problemMatcher": []
+        },
+        {
+            // 默认构建任务(Ctrl+Shift+B):增量编译 Release
+            "label": "CMake Build Release",
+            "type": "shell",
+            "command": "D:/CMAKE/bin/cmake.exe",
+            "args": ["--build", "build", "--config", "Release"],
+            "group": { "kind": "build", "isDefault": true },
+            // $msCompile:识别 MSVC error/warning 格式,"问题"面板点击直达源码行
+            "problemMatcher": ["$msCompile"]
+        },
+        {
+            // Debug 构建:带完整调试符号,供 launch.json 断点调试
+            // (是 launch.json 里 preLaunchTask 的引用目标,别改 label)
+            "label": "CMake Build Debug",
+            "type": "shell",
+            "command": "D:/CMAKE/bin/cmake.exe",
+            "args": ["--build", "build", "--config", "Debug"],
+            "group": "build",
+            "problemMatcher": ["$msCompile"]
+        },
+        // ═══ 不依赖调试器的直跑通道(Ctrl+F5 用)════════════════════
+        // 为什么需要它:VSCode 的 Ctrl+F5(Run Without Debugging)对 cppvsdbg
+        //   是【直接 spawn 进程】,不走调试适配器,所以 launch.json 里的
+        //   "environment" 不生效 → 找不到 Qt5Cored.dll → 系统弹窗
+        //   "无法找到 DLL"、窗口永远起不来(实测 MainWindowHandle=0)。
+        //   F5 走调试适配器,environment 生效,所以只有 F5 能用。
+        // 根治方案:把 Qt bin 永久加进【用户级】PATH(已在本机执行),
+        //   那样 F5/Ctrl+F5/双击 exe 全都能跑。这两个任务是备份通道 ——
+        //   换机器或环境变量被清掉时,在终端面板选它照样能起界面。
+        {
+            "label": "interactive_demo 直跑 (无调试)",
+            "type": "process",              // 直接拉起进程,不经 shell
+            "command": "${workspaceFolder}/build/Debug/interactive_demo.exe",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "tree_tabs 直跑 (无调试)",
+            "type": "process",
+            "command": "${workspaceFolder}/build/Debug/tree_tabs.exe",
+            "options": {
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "PATH": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                }
+            },
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            // 组合任务:先编译 Release 再直接运行,看终端打印的七场景验证
+            "label": "Build & Run",
+            "dependsOrder": "sequence",              // 顺序执行依赖(而非并行)
+            "dependsOn": ["CMake Build Release"],
+            "type": "shell",
+            "command": "${workspaceFolder}/build/Release/navtree_demo.exe",
+            "options": {
+                "env": {
+                    // 运行时把 Qt bin 前置进 PATH,解决 Qt5Core.dll 找不到的问题
+                    "PATH": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                }
+            },
+            "presentation": {
+                "reveal": "always",       // 运行时自动弹出终端
+                "panel": "dedicated"      // 独占终端,输出不与编译日志混排
+            },
+            "problemMatcher": []
+        }
+    ]
+}

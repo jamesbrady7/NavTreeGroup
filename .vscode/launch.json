@@ -1,0 +1,134 @@
+{
+    // ═══ 调试配置:F5 启动,preLaunchTask 自动先编译 ═══
+    "version": "0.2.0",
+    "configurations": [
+        {
+            // ── 交互压力测试:右键节点跑五种交互(增/删/多选分组/删组/两种全量重建)──
+            // 会弹出真实窗口(不设 offscreen)。断点推荐:createAndAttach / deleteChildRaw
+            //   / clearDescendants / onDelete / onRebuild —— 三政体挂载与销毁的现场
+            "name": "调试 interactive_demo (Debug)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/interactive_demo.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "PATH", "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 无窗口自检:A~I 九步驱动五交互+两重建,退出码=失败数 ──
+            "name": "interactive_demo 自检 (offscreen)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/interactive_demo.exe",
+            "args": ["--selftest"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "PATH", "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}" },
+                { "name": "QT_QPA_PLATFORM", "value": "offscreen" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 主力:场景全集窗口(一个 tab 一个 case,可点按钮交互)──
+            // 推荐断点位置:
+            //   · TreeProjection::revalidate     —— 观察活列表比对与流水线全过程
+            //   · TreeProjection::parentOf       —— 观察多层分组的逐层下钻
+            //   · TreeProjection::dropProjection —— 观察级联拆除
+            //   · t5Remove / t6Rebuild(tabs_demo.cpp)—— 两条更新通道的现场
+            "name": "调试 tree_tabs (Debug)",
+            "type": "cppvsdbg",        // MSVC 产物必须用 cppvsdbg(不是 cppdbg/gdb)
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/tree_tabs.exe",
+            "args": [],                 // 加 "--selftest" 可无交互自动跑 Tab⑤⑥ 并校验
+            "stopAtEntry": false,       // true = 启动即停在 main 入口
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    // 运行时 DLL 搜索路径:msvc2019_64/bin 同时有
+                    // Qt5Core.dll(Release)与 Qt5Cored.dll(Debug),一条 PATH 两用
+                    "name": "PATH",
+                    "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                }
+            ],
+            "console": "integratedTerminal",   // 输出进集成终端(中文树形符号正常)
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 无窗口回归验证:offscreen 自检,退出码=结果(适合 CI/快速核对)──
+            "name": "tree_tabs 自检 (offscreen)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/tree_tabs.exe",
+            "args": ["--selftest"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "PATH", "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}" },
+                { "name": "QT_QPA_PLATFORM", "value": "offscreen" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 终端版双通道验证(无 GUI,信号日志打 stdout)──
+            "name": "调试 gui_demo (Debug)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/gui_demo.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "PATH",
+                    "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                },
+                { "name": "QT_QPA_PLATFORM", "value": "offscreen" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 单元测试:16 块,每块打印 职责/输入/输出/校验(纯 Core,秒级跑完)──
+            // 想理解某一块代码时:先跑它看输入输出,再断点进对应函数
+            // (纯函数阶段在 pipeline.h,断点推荐:bucketByKey / matchReusable / revalidate)
+            "name": "运行 unit_tests (Debug)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/unit_tests.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "PATH", "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}" }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Debug"
+        },
+        {
+            // ── 控制台十场景(纯 Core,无窗口)──
+            "name": "运行 navtree_demo (Release)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/navtree_demo.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                {
+                    "name": "PATH",
+                    "value": "D:\\Qt\\5.15.2\\msvc2019_64\\bin;${env:PATH}"
+                }
+            ],
+            "console": "integratedTerminal",
+            "preLaunchTask": "CMake Build Release"
+        }
+    ]
+}

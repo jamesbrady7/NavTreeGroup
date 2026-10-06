@@ -1,0 +1,32 @@
+{
+    // ═══ IntelliSense 兜底配置 ═══
+    // 装了 CMake Tools 时以 configurationProvider 为准(settings.json 已指定),
+    // 本文件保证没装 CMake Tools / configure 未跑过时也有基本补全与跳转。
+    "version": 4,
+    "configurations": [
+        {
+            "name": "Win32-MSVC-Qt5",
+            "includePath": [
+                // 工程源码(guibase.h / groupengine.h 都在根目录)
+                "${workspaceFolder}",
+                // Qt 头文件:本工程只链 Core(GeomObject 用到 QObject)
+                "D:/Qt/5.15.2/msvc2019_64/include",
+                "D:/Qt/5.15.2/msvc2019_64/include/QtCore"
+            ],
+            "defines": [
+                "WIN32", "_WINDOWS",
+                "UNICODE", "_UNICODE",     // Windows 宽字符 API
+                "QT_CORE_LIB",              // Qt Core 导出宏
+                "QT_NO_DEBUG", "NDEBUG"     // 按 Release 语义解析(Q_ASSERT 等)
+            ],
+            // 真实 cl.exe 路径:cpptools 会顺带解析 MSVC 标准库与内建宏
+            // (路径含空格没关系,正斜杠全路径即可)
+            "compilerPath": "D:/VS2019/VS IDE/VC/Tools/MSVC/14.29.30133/bin/Hostx64/x64/cl.exe",
+            "cStandard": "c17",
+            "cppStandard": "c++17",         // 与 CMakeLists 的 CXX_STANDARD 17 一致
+            "intelliSenseMode": "windows-msvc-x64",
+            // 有 CMake Tools 时它接管以上所有猜测,以真实编译参数为准
+            "configurationProvider": "ms-vscode.cmake-tools"
+        }
+    ]
+}
