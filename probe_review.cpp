@@ -1,22 +1,19 @@
 // ═══════════════════════════════════════════════════════════════
-//  probe_review.cpp —— 评审方独立探针(2026-10-06,PROJECT.md §6 验证方职责)
+//  probe_review.cpp —— 评审方独立探针(v4 版,PROJECT.md §6 验证方职责)
 // ═══════════════════════════════════════════════════════════════
-//  目的:对读码发现的三个疑点做【可复跑实证】,不猜测、不以读码代替实测。
+//  v3 评审轮的三个疑点(R1 纪元缺口 / R2 m_nodePage 泄漏 / R3 组上求值 locate)
+//  已随 v4 重构改变了形态,本探针按【v4 契约】重新钉死三件事:
 //
-//  P1 纪元缺口(高危嫌疑):parentOf/rowOf 的快路径在 EpochScope 之前执行,
-//     裸调用它们不会递增 m_queryEpoch → 内部 revalidate 可能命中
-//     "checkedAt == m_queryEpoch" 闸门,吃到【上一次操作】的陈旧账本。
-//     头文件承诺"跨操作纪元必递增 → 一定重新枚举"(m_queryEpoch 注释),
-//     若实证成立,则快路径违反了该承诺(旧实现无快路径时不存在此窗口)。
-//  P2 m_nodePage 清理漏项(中危嫌疑):dropProjection 的清理循环收集
-//     p.flat + p.members 的【键(组指针)】,但 memberToPos/m_nodePage 的键集
-//     是 flat ∪ 各组成员(kv.second)→ 被分组的数据节点条目不会被清掉。
-//  P3 不变量#3 字面漂移(低危):walkBindings 的条件是
-//     `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` —— locate 会先对
-//     组节点求值(旧实现 `!isGroup(n) && b.locate(n)` 从不求值)。
-//     探针只统计"locate 被叫到组节点的次数",>0 即漂移坐实。
+//  P1 v4 通知契约的两半:
+//     a) notifyRemove 之后,裸 rowOf/parentOf(不经任何 childCount 预热)必须
+//        立即新鲜 —— 这是 v3 R1 事故(快路径吃陈旧账本)的正面回归;
+//     b) 静默删除(违约漏通知)→ 允许陈旧,但 prune 卫生边界必须自愈 ——
+//        这是"忘了通知最多陈旧到下一次 prune"承诺的兑现验证。
+//  P2 位置索引 entries 随页同生共死:uninstall 后本页 6 条(2 组+4 成员)全部消失
+//     (v4 单表在页内,无全局副本 → v3 R2 的清理不对称在结构上不可能)。
+//  P3 walkBindings 永不对组节点求值 locate(不变量#3,v3 R3 的回归)。
 //
-//  退出码 = 坐实的疑点数(0 = 三个疑点全部不成立)。
+//  退出码 = 坐实的违约数(0 = 契约全部成立)。
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -49,9 +46,9 @@ static ProjectionSpec matSpec() {
     return s;
 }
 
-// ── P1:数据侧静默变更后,裸 rowOf 快路径是否吃陈旧账本 ──
+// ── P1a:通知即新鲜(裸查询,无预热)── / ── P1b:漏通知 → 陈旧至 prune ──
 static void probe1() {
-    printf("== P1 epoch fast-path staleness ==\n");
+    printf("== P1 v4 notification contract ==\n");
     auto* root = new ProbeNode(nullptr, "R1");
     auto* pg   = new ProbeNode(root, "PG");
     auto* l1   = new ProbeNode(pg, "L1", "A");
@@ -61,79 +58,89 @@ static void probe1() {
     P.registerRoot(root);
     P.install(pg, matSpec(), {});          // GA=[L1,L3]  GB=[L2,L4]
 
-    // op1:一次正常校验(开纪元、建位置索引)。L3 在 GA 里的行号 = 1
-    size_t c1 = P.childCount(pg);
-    int r_before = P.rowOf(l3);
-    printf("  op1 childCount=%zu rowOf(L3)=%d (expect 1)\n", c1, r_before);
+    (void)P.childCount(pg);                // 建账:GA 里 L3 行号 = 1
+    int r0 = P.rowOf(l3);
+    printf("  baseline rowOf(L3)=%d (expect 1)\n", r0);
 
-    // 数据侧静默删除 L1(引擎不感知 —— 这正是"惰性发现"设计要处理的常态)
+    // ── a) 守约:notifyRemove → 裸 rowOf 必须立即 0 ──
+    P.notifyRemove(pg, l1);
     pg->removeTreeChild(l1);
     delete l1;
-
-    // op2:【裸】rowOf —— 旧语义应重新枚举活列表,给出真值 0(GA=[L3]);
-    //      若快路径吃了 op1 纪元的陈旧账本,会答 1
-    int r_stale = P.rowOf(l3);
-
-    // op3:childCount 开新纪元强制重算后,再问一次拿真值
-    size_t c2 = P.childCount(pg);
-    int r_true = P.rowOf(l3);
-    printf("  after silent delete of L1: bare rowOf(L3)=%d | after childCount: rowOf(L3)=%d (truth 0), childCount=%zu\n",
-           r_stale, r_true, c2);
-
-    if (r_stale != r_true) {
-        printf("  [CONFIRMED] P1: bare rowOf returned stale answer %d (truth %d)\n", r_stale, r_true);
+    int rA = P.rowOf(l3);                  // 裸查询,不经 childCount
+    if (rA != 0) {
+        printf("  [CONFIRMED] P1a: after notifyRemove bare rowOf(L3)=%d (truth 0)\n", rA);
         ++g_confirmed;
     } else {
-        printf("  [OK] P1: bare rowOf fresh (hole not reproducible this way)\n");
+        printf("  [OK] P1a: notifyRemove -> bare rowOf fresh (0)\n");
+    }
+
+    // ── b) 违约:静默删 L2 → 允许陈旧;prune 必须自愈 ──
+    auto* l2p = pg->visibleChild(0);       // 现在的原始孩子 = [L2,L3,L4] 里找 L2
+    // 直接按名字找,避免依赖顺序:
+    for (size_t i = 0; i < pg->visibleChildrenCount(); ++i) {
+        auto* bn = dynamic_cast<ProbeNode*>(pg->visibleChild(i));
+        if (bn && bn->name() == "L2") { l2p = bn; break; }
+    }
+    pg->removeTreeChild(l2p);
+    delete l2p;                            // 零通知(违约)
+    int staleRows = (int)P.childCount(pg->visibleChild(0));  // 任意纯读:GB 可能仍显示 2 员(陈旧,契约允许)
+    (void)staleRows;
+    P.prune();                             // 卫生边界:必须自愈
+    // 自愈后:GB 只剩 L4。找到 GB 验证成员数:
+    int gbMembers = -1;
+    for (size_t i = 0; i < P.childCount(pg); ++i) {
+        auto* g = dynamic_cast<TreeGroup*>(P.child(pg, i));
+        if (g && g->ticket().key == "B") gbMembers = (int)P.childCount(g);
+    }
+    if (gbMembers != 1) {
+        printf("  [CONFIRMED] P1b: after silent delete + prune, GB members=%d (truth 1)\n", gbMembers);
+        ++g_confirmed;
+    } else {
+        printf("  [OK] P1b: silent delete stale-tolerated, prune healed (GB=1)\n");
     }
 
     P.unregisterRoot(root);
     P.uninstall(pg);
+    P.collectGarbage();
     delete root;
 }
 
-// ── P2:uninstall 后 m_nodePage 是否残留被分组成员的条目 ──
+// ── P2:entries 随页同生共死 ──
 static void probe2() {
-    printf("== P2 m_nodePage cleanup on dropProjection ==\n");
+    printf("== P2 entries lifecycle ==\n");
     auto* root = new ProbeNode(nullptr, "R2");
     auto* pg   = new ProbeNode(root, "PG");
     for (int i = 0; i < 4; ++i)
         new ProbeNode(pg, "L" + std::to_string(i), i % 2 ? "B" : "A");
     P.registerRoot(root);
     P.install(pg, matSpec(), {});
-    size_t c = P.childCount(pg);           // 建索引:flat 2 组 + 4 成员 = 6 条
-    size_t np_before = P.memoryBreakdown().nodePage;
-    size_t mtp_hint = 0;                   // 本页 memberToPos 规模推断:6
-    (void)c; (void)mtp_hint;
-    P.uninstall(pg);                        // dropProjection(deferDelete=false)
-    P.collectGarbage();                     // 清掉立即删除语义下可能的残留(不影响 m_nodePage)
-    size_t np_after = P.memoryBreakdown().nodePage;
-    printf("  nodePage entries: before uninstall=%zu after=%zu (page contributed 6: 2 groups + 4 members)\n",
-           np_before, np_after);
-    size_t removed = np_before - np_after;
-    if (removed < 6) {
-        printf("  [CONFIRMED] P2: only %zu of 6 entries removed -> %zu stale entries left\n",
-               removed, 6 - removed);
+    (void)P.childCount(pg);                // 建账:flat 2 组 + 4 成员 = entries 6 条
+    size_t np_before = P.memoryBreakdown().entries;
+    P.uninstall(pg);
+    P.collectGarbage();
+    size_t np_after = P.memoryBreakdown().entries;
+    printf("  entries: before uninstall=%zu after=%zu (page contributed 6)\n", np_before, np_after);
+    if (np_before - np_after != 6) {
+        printf("  [CONFIRMED] P2: removed %zu of 6 entries\n", np_before - np_after);
         ++g_confirmed;
     } else {
-        printf("  [OK] P2: all 6 entries removed\n");
+        printf("  [OK] P2: all 6 entries died with the page\n");
     }
     P.unregisterRoot(root);
     delete root;
 }
 
-// ── P3:rebind 期间 locate 是否被叫到组节点上 ──
+// ── P3:rebind 期间 locate 不得被叫到组节点上 ──
 static int g_locateOnGroups = 0;
 static void probe3() {
-    printf("== P3 locate evaluated on group nodes ==\n");
+    printf("== P3 locate never evaluated on groups ==\n");
     auto* root = new ProbeNode(nullptr, "R3");
     auto* pg   = new ProbeNode(root, "PG");
     for (int i = 0; i < 4; ++i)
         new ProbeNode(pg, "L" + std::to_string(i), i % 2 ? "B" : "A");
     P.registerRoot(root);
-    P.install(pg, matSpec(), {});           // ★ 先手动装页建出组,否则树里没有组节点,
-                                            //   walkBindings 根本走不到组 → 探针空转(第一版设计缺陷)
-    P.childCount(pg);                       // 确保 flat/组已生成
+    P.install(pg, matSpec(), {});          // 先建出组,DFS 才会走到组节点
+    (void)P.childCount(pg);
     TreeProjection::SpecBinding b;
     b.id = "probe3";
     b.locate = [](GuiBase* n) {
@@ -144,14 +151,15 @@ static void probe3() {
     P.rebind();
     printf("  locate() calls on TreeGroup nodes during bindSpec+rebind: %d\n", g_locateOnGroups);
     if (g_locateOnGroups > 0) {
-        printf("  [CONFIRMED] P3: invariant-3 wording ('locate never evaluated on groups') drifted\n");
+        printf("  [CONFIRMED] P3: invariant-3 violated (locate saw groups)\n");
         ++g_confirmed;
     } else {
         printf("  [OK] P3: locate never saw a group node\n");
     }
     P.unbindSpec("probe3");
     P.unregisterRoot(root);
-    P.uninstall(pg);   // 幂等(可能没装过)
+    P.uninstall(pg);
+    P.collectGarbage();
     delete root;
 }
 
@@ -161,13 +169,13 @@ int main() {
     probe2();
     probe3();
     printf("== summary: %d confirmed ==\n", g_confirmed);
-    // 清场自检
-    {
+    {   // 清场:挂探针根再 prune(m_roots 为空时 prune 直接 return,清不掉僵尸)
         ProbeNode probe(nullptr, "__purge__");
         P.registerRoot(&probe);
         P.prune();
         P.unregisterRoot(&probe);
     }
+    P.collectGarbage();
     printf("teardown: liveGroups=%zu retired=%zu\n", P.liveGroupCount(), P.retiredCount());
-    return 0;   // 探针只报告,不设失败退出码(结论由评审文本给出)
+    return g_confirmed ? 1 : 0;
 }

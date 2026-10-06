@@ -25,6 +25,7 @@
 #include <vector>
 #include <map>
 #include <random>
+#include <unordered_set>   // pbreak A/B 对照用(不再从 treeprojection.h 传递包含)
 #ifdef Q_OS_WIN
 #include <windows.h>
 #include <psapi.h>
@@ -229,7 +230,7 @@ static void scenarioMem() {
     printf("    账页(m_byParent)          %10zu\n", mb.pages);
     printf("    存活组                    %10zu   (= m_groupOwner)\n", mb.groupOwner);
     printf("    分组成员指针(memberPtr)    %10zu\n", mb.memberPtr);
-    printf("    memberToGroup 条目        %10zu\n", mb.memberToGroup);
+    printf("    entries 条目(位置单表)   %10zu\n", mb.entries);
     printf("    lastLive 指针             %10zu\n", mb.lastLivePtr);
     printf("    flat 指针                 %10zu\n", mb.flatPtr);
     printf("  字节(估算口径见 treeprojection.cpp memoryBreakdown):\n");
@@ -238,11 +239,9 @@ static void scenarioMem() {
     printf("    lastLive(缓存钥匙)        %10.1f MB\n", mbT(mb.lastLiveBytes));
     printf("    flat(投影序列)            %10.1f MB\n", mbT(mb.flatBytes));
     printf("    p.members(组->成员)        %10.1f MB\n", mbT(mb.membersBytes));
-    printf("    memberToGroup             %10.1f MB\n", mbT(mb.memberToGroupBytes));
-    printf("    memberToPos(位置索引)     %10.1f MB   (条目 %zu)\n",
-           mbT(mb.memberToPosBytes), mb.memberToPos);
-    printf("    m_nodePage(节点->页)      %10.1f MB   (条目 %zu)\n",
-           mbT(mb.nodePageBytes), mb.nodePage);
+    printf("    entries(位置单表)         %10.1f MB   (v3 时这里是三张表:\n",
+           mbT(mb.entriesBytes));
+    printf("      v3 对照:memberToGroup 54.1 + memberToPos 74.3 + nodePage 65.9 = 194 MB)\n");
     printf("    p.groups + m_groupOwner   %10.1f MB\n",
            mbT(mb.groupsBytes + mb.groupOwnerBytes));
     printf("    ------------------------------------\n");
@@ -360,7 +359,7 @@ static void scenarioIncremental() {
             int row = P.rowOf(v);
             (void)row;
             GuiBase* dataPar = v->parentForTree();
-            P.discard(v);                          // 讣告(叶子无投影,幂等)
+            P.notifyRemove(dataPar, v);            // ★v4:invalidate(父页)+discard(死者)
             dataPar->removeTreeChild(v);
             delete v;
             volatile size_t c = P.childCount(par); // 触发受影响父亲 revalidate
@@ -377,6 +376,10 @@ static void scenarioRebuild() {
     P.resetRetiredHighWater();
     size_t retiredAtStart = P.retiredCount();
     // wipe:删掉全部剩余叶子(从 internals 里挑 P 层清孩子)
+    // ★ 本场景刻意【保持静默删除】(只 discard 叶子,不 invalidate 父页):
+    //   全量重建通道的生产契约就是 "wipe → prune → rebuild → rebind" ——
+    //   prune/rebind 是卫生边界,漏通知的陈旧页在边界上全量自愈(healIfDrift)。
+    //   这里同时压测的就是自愈路径本身的成本。
     QElapsedTimer t; t.start();
     for (BenchNode* n : g_tree.internals) {
         if (n->name()[0] != 'P') continue;
@@ -628,7 +631,9 @@ static void scenarioGcStress() {
             root->removeTreeChild(b);
             delete b;
         }
-        (void)P.childCount(root);                    // 组蒸发 → m_retired
+        P.invalidate(root);                          // ★v4:父页孩子列表变了(两条路径都要;
+                                                     //   A/B 验的是"死者账页"的清理路,与此正交)
+        (void)P.childCount(root);                    // 脏页重算 → 组蒸发 → m_retired
         if (!discardPath) {
             // 路径 B:账页已成僵尸,靠 prune 清理(这才是要验的那条路)
             P.prune();
@@ -852,7 +857,7 @@ static int scenarioDbg() {
     for (BenchNode* pn : parts) {
         while (pn->visibleChildrenCount() > 0) {
             GuiBase* c = pn->visibleChild(0);
-            P.discard(c);
+            P.notifyRemove(pn, c);                   // ★v4 通知(delete 前)
             pn->removeTreeChild(c);
             delete c;
         }
@@ -867,6 +872,7 @@ static int scenarioDbg() {
             auto* nf = new BenchNode(pn, "F" + std::to_string(f), MATERIALS[f % 2]);
             newAddrs.push_back(nf);
         }
+        P.invalidate(pn);                            // ★v4:重建后通知(双配置输出确定)
     }
     for (GuiBase* n : newAddrs)
         for (GuiBase* o : oldAddrs)

@@ -177,6 +177,7 @@ static void t5Remove(PartObject*& slot, const QString& what) {
     g_t5->log->appendPlainText("---- " + what + " ----");
     GuiBase* par = P.parentOf(victim);                  // ① 死前问坐标
     if (!par || P.rowOf(victim) < 0) {                  // ② 被过滤 → 零信号直接删
+        P.notifyRemove(g_t5->M->root, victim);          // ★v4 通知(delete 前)
         g_t5->M->root->destroySubDataGroup(victim);
         g_t5->log->appendPlainText("(rowOf<0:不在投影树上 → 未发任何信号)");
         slot = nullptr;
@@ -185,10 +186,12 @@ static void t5Remove(PartObject*& slot, const QString& what) {
     // ③ 级联预判(多层版):信号发在最外层会蒸发的组上
     if (GuiBase* cas = cascadeTarget(P, victim)) {
         g_t5->model->beginRowRemoval(P.parentOf(cas), P.rowOf(cas));
+        P.notifyRemove(g_t5->M->root, victim);          // ★v4 通知
         g_t5->M->root->destroySubDataGroup(victim);
         g_t5->model->endRowRemoval();
     } else {                                            // ④ 普通成员行
         g_t5->model->beginRowRemoval(par, P.rowOf(victim));
+        P.notifyRemove(g_t5->M->root, victim);          // ★v4 通知
         g_t5->M->root->destroySubDataGroup(victim);
         g_t5->model->endRowRemoval();
     }

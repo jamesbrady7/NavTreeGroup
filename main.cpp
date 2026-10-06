@@ -221,16 +221,21 @@ int main() {
            (void*)steelBefore, (void*)steelAfter,
            steelBefore == steelAfter ? "SAME (model state preserved)" : "CHANGED");
 
-    // ═══ 场景 4:数据侧删除 → 自动蒸发 ═══
-    printf("\n====== S4 data-side delete BoltB & Cover -> groups auto-evaporate ======\n");
+    // ═══ 场景 4:数据侧删除 + 通知 → 下次读自动蒸发(v4 契约)═══════
+    // v4:变更发现从"每次读枚举比对"换成"调用方通知置脏" ——
+    //   notifyRemove 必须在 delete【之前】(它内含 discard,且 invalidate 只置标志)。
+    //   忘了通知也不崩:陈旧最多活到下一次卫生边界(prune/rebind/refresh 自愈,见 S8)。
+    printf("\n====== S4 data-side delete BoltB & Cover (with notify) -> groups auto-evaporate ======\n");
     printf("--- before ---\n");
     printTree(root);
     printf("  liveGroupCount = %d\n", (int)E.liveGroupCount());
-    root->destroySubDataGroup(boltB);    // 裸 delete,零展示层通知 —— 引擎不需要同步!
+    E.notifyRemove(root, boltB);           // ★v4:invalidate(root) + discard(boltB)
+    root->destroySubDataGroup(boltB);
+    E.notifyRemove(root, cover);           // 被过滤节点也要通知(它占着原始活列表)
     root->destroySubDataGroup(cover);
     const DataSnapshot snap4 = snapshot(root);   // 删除是数据侧合法变更,基线在删除后重拍
-    printf("--- after (next childCount revalidates from live enumeration) ---\n");
-    printTree(root);                             // 这次遍历触发 revalidate = 引擎的全部"动作"
+    printf("--- after (next childCount sees dirty flag -> one recompute) ---\n");
+    printTree(root);                             // 这次遍历触发重算 = 引擎的全部"动作"
     printf("  liveGroupCount = %d (Alum & Suppressed groups gone; no dangling pointer ever stored)\n",
            (int)E.liveGroupCount());
     verify(root, snap4, checked);   // 证明引擎重算过程对数据侧零写入

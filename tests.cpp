@@ -218,10 +218,14 @@ static void t5_flat() {
     auto* gA = new TreeGroup(GroupTicket{ "Alum", "Alum", 0 }, nullptr);
     // vis 顺序:Base BoltA BoltB Cover Sketch;Steel 首成员=Base(位0),Alum 首成员=BoltB(位2)
     std::vector<GuiBase*> vis = { w.base, w.boltA, w.boltB, w.cover, w.sketch };
-    std::unordered_map<GuiBase*, TreeGroup*> m2g = { { w.base, gS }, { w.boltA, gS },
-                                                    { w.boltB, gA }, { w.cover, gA } };
-    auto flat = Pipeline::buildFlat(vis, m2g);
-    showIn("vis = " + lst(vis) + ",  memberToGroup = {Base,BoltA→Steel; BoltB,Cover→Alum}");
+    // v4:buildFlat 吃"阶段① entries"(只含成员行,container=组;owner 用于判直属)
+    std::unordered_map<GuiBase*, PosEntry> entries;
+    entries[w.base]   = PosEntry{ gS, 0 };
+    entries[w.boltA]  = PosEntry{ gS, 1 };
+    entries[w.boltB]  = PosEntry{ gA, 0 };
+    entries[w.cover]  = PosEntry{ gA, 1 };
+    auto flat = Pipeline::buildFlat(vis, entries, w.root);
+    showIn("vis = " + lst(vis) + ",  entries = {Base,BoltA→Steel; BoltB,Cover→Alum}");
     showOut("flat = " + lst(flat));
     expectList(flat, { gS, gA, w.sketch }, "5 个节点收敛成 3 行:两组各占首成员位置,Sketch 原位");
     delete gS; delete gA;
@@ -266,7 +270,7 @@ static void t7_endToEnd() {
 }
 
 static void t8_cache() {
-    hdr("T8", "缓存(lastLive 比对)", "数据没变 → 整条流水线跳过;变了 → 自动重算");
+    hdr("T8", "缓存(v4:脏标志)", "数据没变 → 干净页零枚举直接答缓存;变了+通知 → 重算");
     World w = makeWorld(true);
     P.install(w.root, stdSpec());
     auto* steel1 = findGroup(w.root, "Steel");
@@ -276,9 +280,10 @@ static void t8_cache() {
     showOut("Steel 组指针 第一次=0x" + std::to_string((uintptr_t)steel1)
             + " 第二次=0x" + std::to_string((uintptr_t)steel2));
     check(steel1 == steel2, "活列表没变 → 缓存命中,组指针稳定");
-    // 数据侧新增一个零件 → 指针序列变了 → 重算,新成员自动进组(dynamicAll)
+    // 数据侧新增一个零件 → 通知置脏 → 下次读重算,新成员自动进组(dynamicAll)
     auto* rod = new PartObject("Rod", "Steel", w.root);
     w.root->addSubDataGroup(rod);
+    P.invalidate(w.root);                              // ★v4 契约:结构变更后必须通知
     auto* steel3 = findGroup(w.root, "Steel");
     showIn("数据侧新增 Rod(Steel) → live 序列变化");
     showOut("Steel 组成员 = " + lst(kids(steel3)));
@@ -315,13 +320,16 @@ static void t10_evaporate() {
     size_t before = P.childCount(w.root);
     size_t groupsBefore = P.liveGroupCount();
     showIn("投影 = " + lst(kids(w.root)) + ",  liveGroupCount=" + std::to_string(groupsBefore));
-    w.root->destroySubDataGroup(w.boltB);              // Alum 组唯一成员,数据侧直接删
+    P.notifyRemove(w.root, w.boltB);                   // ★v4:先通知(delete 前),再删
+    w.root->destroySubDataGroup(w.boltB);              // Alum 组唯一成员
     w.boltB = nullptr;
-    auto flat = kids(w.root);                          // 这一问触发重算
+    auto flat = kids(w.root);                          // 这一问触发重算(页已脏)
     showOut("删 BoltB 后投影 = " + lst(flat) + ",  liveGroupCount=" + std::to_string(P.liveGroupCount()));
     check(flat.size() == before - 1, "root 行数 3→2:Alum 组整组蒸发");
     check(!findGroup(w.root, "Alum") && findGroup(w.root, "Steel"), "Alum 没了,Steel 还在");
-    check(P.liveGroupCount() == groupsBefore - 1, "引擎释放了空组(无泄漏)");
+    check(P.liveGroupCount() == groupsBefore - 1, "空组退出账本(读侧触发 → 进 m_retired)");
+    P.collectGarbage();                                // 无视图场景:安全点回收
+    check(P.retiredCount() == 0, "回收后待回收队列清空(无泄漏)");
     P.uninstall(w.root);
     freeWorld(w);
 }
@@ -500,6 +508,7 @@ static void t16_signals() {
     int row = P.rowOf(w.boltA);
     showIn("BoltA 死前坐标:parentOf=" + nm(par) + ", rowOf=" + std::to_string(row));
     model.beginRowRemoval(par, row);
+    P.notifyRemove(w.root, w.boltA);                   // ★v4:通知在 delete 前(begin/end 括号内)
     w.root->destroySubDataGroup(w.boltA);
     model.endRowRemoval();
     showOut("信号计数 removed=" + std::to_string(removed));
@@ -512,17 +521,20 @@ static void t16_signals() {
     showIn("BoltB 是 Alum 组最后成员=" + std::string(last ? "true" : "false")
            + " → 改报组坐标 rowOf(Alum组)=" + std::to_string(grow));
     model.beginRowRemoval(P.parentOf(par), grow);
+    P.notifyRemove(w.root, w.boltB);                   // ★v4 通知
     w.root->destroySubDataGroup(w.boltB);
     model.endRowRemoval();
     showOut("信号计数 removed=" + std::to_string(removed));
     check(removed == 2 && !findGroup(w.root, "Alum"), "整组蒸发只发 root 层 1 条(累计 2)");
 
-    // ③ 被过滤节点:rowOf=-1 → 零信号
+    // ③ 被过滤节点:rowOf=-1 → 零信号(但它仍在【原始】孩子列表里 → 通知照样要给)
     check(P.rowOf(w.cover) == -1, "Cover 死前 rowOf=-1(不在投影树上)");
-    w.root->destroySubDataGroup(w.cover);              // 无需任何信号
+    P.notifyRemove(w.root, w.cover);                   // ★v4:被过滤≠不用通知(它占着 lastLive)
+    w.root->destroySubDataGroup(w.cover);              // 无需任何视图信号
     showOut("删 Cover 后 removed=" + std::to_string(removed) + "(未增加)");
     check(removed == 2 && inserted == 0, "零信号 = 正确(视图上本来就没有这一行)");
     P.uninstall(w.root);
+    P.collectGarbage();
     freeWorld(w);
 }
 
@@ -547,8 +559,12 @@ static void t17_readSideRelease() {
            + " 个成员;liveGroupCount=" + std::to_string(groupsBefore));
     size_t retiredBefore = P.retiredCount();
 
-    // 数据侧裸删 Alum 的全部成员(零通知,不走任何引擎 API)
+    // 数据侧删 Alum 的全部成员(v4:通知后删 —— 本块要验的是"淘汰由【只读查询】
+    // 触发时,组只进 m_retired 不 delete";v3 时代这里是零通知裸删,靠枚举发现,
+    // v4 的发现机制换成了通知,契约主体不变:触发淘汰的仍是一句纯读)
+    P.notifyRemove(w.root, w.boltB);
     w.root->destroySubDataGroup(w.boltB);
+    P.notifyRemove(w.root, w.cover);
     w.root->destroySubDataGroup(w.cover);
     w.boltB = w.cover = nullptr;
 
@@ -565,6 +581,7 @@ static void t17_readSideRelease() {
 
     // 地址未被复用:回收前旧组内存仍被占用 → 旧 internalPointer 不会指向别人
     w.root->addSubDataGroup(new PartObject("BoltB2", "Alum", w.root));
+    P.invalidate(w.root);                              // ★v4:新增也要通知
     w.boltB = nullptr;
     P.childCount(w.root);
     GuiBase* alum2 = findGroup(w.root, "Alum");
@@ -625,6 +642,7 @@ static void t18_modelProtocol() {
         //    不蒸发)—— 这条走成员行路径,组存活,只让 Tester 查协议自洽。
         GuiBase* par = P.parentOf(w.boltA);
         model.beginRowRemoval(par, P.rowOf(w.boltA));
+        P.notifyRemove(w.root, w.boltA);               // ★v4 通知
         w.root->destroySubDataGroup(w.boltA);
         w.boltA = nullptr;
         model.endRowRemoval();
@@ -675,6 +693,7 @@ static void t18_modelProtocol() {
 
         // ── 正例:用 cascadeTarget 发信号,验证参数确实是"组行" ──
         model.beginRowRemoval(rightParent, rightRow);
+        P.notifyRemove(w.root, w.boltB);               // ★v4 通知
         w.root->destroySubDataGroup(w.boltB);
         w.boltB = nullptr;
         model.endRowRemoval();
@@ -776,6 +795,7 @@ static void t19_cascadeMultiLayer() {
         [&](const QModelIndex& p, int f, int) { if (!sigCount) { sigParent = p; sigFirst = f; } ++sigCount; });
 
     model.beginRowRemoval(P.parentOf(cas), P.rowOf(cas));
+    P.notifyRemove(root, part);                        // ★v4 通知(delete 前)
     root->destroySubDataGroup(part);
     model.endRowRemoval();
 
@@ -895,72 +915,64 @@ static void silenceCrtDialogs() {
 #endif
 }
 
-// T20:纪元优化的逃生阀 + 跨线程检测(契约 C5)
-//   C5 的前提"单线程 + 一次操作内数据不变"原来只写在注释里,没有开关。
-//   本块验证:
-//     ① 开关真的接到了闸门上(关闭后 checkedAt 不再生效);
-//     ② 开关开/关【行为完全一致】—— 这是"逃生阀"的定义,不是优化项;
-//     ③ 关闭时所有页的 checkedAt 被清零(让"关掉就一定全量枚举"可推理)。
-static void t20_epochEscapeHatch() {
-    hdr("T20", "纪元优化逃生阀(setEpochOptimization)",
-        "开关要真的接在闸门上,且开关开/关行为完全一致(只是快慢不同)");
-    World w = makeWorld(false);
-    P.install(w.root, stdSpec());
+// T20(v4):漏通知的检测与自愈(paranoid + prune 两层兜底)
+//   v4 契约:数据变更后调用方【必须】通知(invalidate/notifyRemove);
+//   漏通知不崩溃,只投影陈旧,并由两层兜底收敛:
+//     ① paranoid(默认 Debug 开):childCount 对干净页额外比对 lastLive,
+//        漂移 → stderr 点名 + 当场自愈(开发期一跑就暴露漏报点);
+//     ② prune(双配置都跑):卫生边界全量自愈 —— "忘了通知,陈旧最多活到下一次 prune"。
+//   分辨力:去掉 healIfDrift 的任何一层,对应断言必红。
+static void t20_paranoidAndHeal() {
+    hdr("T20", "漏通知检测与自愈(paranoid + prune)",
+        "静默删除后:paranoid 开=childCount 当场自愈;paranoid 关=陈旧到 prune 为止");
+    auto* root = new NamedData("R20");
+    auto* flat = new FolderObject("页", root);
+    root->addSubDataGroup(flat);
+    std::vector<PartObject*> lv;
+    for (int i = 0; i < 4; ++i) {
+        auto* l = new PartObject("L" + std::to_string(i), (i % 2) ? "B" : "A", flat);
+        flat->addSubDataGroup(l);
+        lv.push_back(l);
+    }
+    P.registerRoot(root);
+    ProjectionSpec sp;
+    sp.grouping = GroupRules::byKey([](GuiBase* n) {
+        auto* p = dynamic_cast<PartObject*>(n);
+        return p ? p->material() : std::string();
+    });
+    sp.opt.dynamicAll = true;
+    P.install(flat, sp, {});            // GA=[L0,L2]  GB=[L1,L3]
+    check(P.childCount(flat) == 2, "① 前置:两组");
 
-    // 记录基准形态:开/关两种情况下,投影树必须【逐项相同】
-    auto snapshot = [&] {
-        std::string s;
-        for (size_t i = 0, n = P.childCount(w.root); i < n; ++i) s += nm(P.child(w.root, i)) + "|";
-        return s;
-    };
+    // ── ① paranoid 开:静默删除(不通知)→ childCount 当场自愈 ──
+    bool oldParanoid = P.paranoidChecks();
+    P.setParanoidChecks(true);
+    flat->destroySubDataGroup(lv[0]);   // 静默删 L0(GA 成员),引擎未收到任何通知
+    flat->destroySubDataGroup(lv[2]);   // 静默删 L2 → GA 应蒸发
+    size_t cc = P.childCount(flat);     // paranoid 比对发现漂移 → 置脏 → 重算
+    showOut("paranoid 开,静默删光 GA 后 childCount = " + std::to_string(cc) + "(真值 1)");
+    check(cc == 1, "★① paranoid:漏通知被 childCount 当场自愈(GA 蒸发,只剩 GB)");
+    P.collectGarbage();                 // 无视图场景,直接回收淘汰组
 
-    // ── ① 打开(默认):验证闸门【生效】──
-    //   手法:直接问引擎"本页 checkedAt 是否等于当前纪元"。
-    //   不能从外部观察,改用等价手段:同一操作内连续问两次 rowCount,
-    //   若闸门生效,第二次不该重新跑流水线(否则会多产生一次结构递增)。
-    check(P.epochOptimizationEnabled(), "① 默认:纪元优化是开着的");
-    size_t rev0 = P.structRev();
-    volatile size_t a1 = P.childCount(w.root);
-    volatile size_t a2 = P.childCount(w.root);   // 同一次"操作"?否 —— 两次独立操作
-    (void)a1; (void)a2;
-    size_t rev1 = P.structRev();
-    // 数据没变 → 两次操作都不该改形状(结构递增只在形状变化时发生)
-    check(rev1 == rev0, "① 数据未变时重复查询不改变结构(闸门语义正确)");
-
-    std::string shapeOn = snapshot();
-
-    // ── ② 关闭:同一棵树,行为必须逐项相同 ──
-    P.setEpochOptimization(false);
-    check(!P.epochOptimizationEnabled(), "② 开关已关闭");
-    std::string shapeOff = snapshot();
-    showOut("开: " + shapeOn);
-    showOut("关: " + shapeOff);
-    check(shapeOn == shapeOff,
-          "★② 开关开/关,投影树逐项相同(逃生阀只改快慢,不改行为)");
-
-    // 关掉之后数据侧变更仍必须被发现(这是全枚举路径的核心正确性)
-    w.root->destroySubDataGroup(w.boltB);
-    w.boltB = nullptr;
-    size_t ccOff = P.childCount(w.root);
-    bool boltBGone = true;
-    for (size_t i = 0, n = P.childCount(w.root); i < n; ++i)
-        if (P.child(w.root, i) == static_cast<GuiBase*>(w.boltB)) boltBGone = false;
-    check(boltBGone && ccOff > 0,
-          "★② 关闭状态下,数据侧删除仍被惰性发现(组自动蒸发)");
-
-    // ── ③ 关→开:恢复后行为仍一致,且 checkedAt 机制重新生效 ──
-    P.setEpochOptimization(true);
-    check(P.epochOptimizationEnabled(), "③ 开关已恢复");
-    std::string shapeBack = snapshot();
-    check(shapeBack == shapeOff || shapeBack == shapeOn,
-          "★③ 恢复后投影树仍自洽(无中间态残留)");
-    // 清理:无论开关状态如何,retired 都要能收干净
+    // ── ② paranoid 关:静默删除 → 允许陈旧,prune 兜底收敛 ──
+    P.setParanoidChecks(false);
+    flat->destroySubDataGroup(lv[1]);   // 静默删 L1
+    flat->destroySubDataGroup(lv[3]);   // 静默删 L3 → GB 实际已空
+    size_t stale = P.childCount(flat);  // 干净页零枚举 → 答陈旧 flat
+    showOut("paranoid 关,静默删光 GB 后 childCount = " + std::to_string(stale)
+            + "(陈旧值 1,真值 0 —— 契约允许)");
+    check(stale == 1, "② paranoid 关:漏通知 → 投影陈旧(这是契约,不是 bug)");
+    P.prune();                          // 卫生边界:全量自愈
+    size_t healed = P.childCount(flat);
+    check(healed == 0, "★② prune 自愈:陈旧页在卫生边界收敛(GB 蒸发)");
     P.collectGarbage();
-    check(P.retiredCount() == 0, "③ 开关切回不影响回收语义");
 
-    P.uninstall(w.root);
+    P.setParanoidChecks(oldParanoid);
+    P.uninstall(flat);
+    P.unregisterRoot(root);
     P.collectGarbage();
-    freeWorld(w);
+    clearData(root);
+    delete root;
 }
 
 // T22:裸坐标查询的新鲜度(评审修复 R1 的回归,2026-10-06)
@@ -995,15 +1007,18 @@ static void t22_bareCoordFreshness() {
     P.install(flat, sp, {});            // GA=[L1,L3]  GB=[L2,L4]
     showIn("页装投影(材料 2 组);先 childCount 校验建索引,再静默删 L1");
 
-    (void)P.childCount(flat);           // op1:校验 + 位置索引登记(L3 → GA 行 1)
+    (void)P.childCount(flat);           // op1:重算 + entries 登记(L3 → GA 行 1)
     check(P.rowOf(l3) == 1, "① 前置:GA=[L1,L3],L3 行号 = 1");
 
-    flat->destroySubDataGroup(l1);      // 数据侧静默删除(引擎不感知,靠惰性发现)
+    // v4 契约:删除 → notifyRemove(必须在 delete 前;= invalidate(页)+discard(死者))
+    P.notifyRemove(flat, l1);
+    flat->destroySubDataGroup(l1);
 
-    // ★ 关键断言:下一个引擎调用是【裸 rowOf】(不开纪元的旧实现会吃 op1 的陈旧账)
+    // ★ 关键断言:下一个引擎调用是【裸 rowOf】—— 通知过后必须立即新鲜,
+    //   不需要任何 childCount 预热(v3 的 R1 病灶:快路径跳过校验吃陈旧账)
     int r = P.rowOf(l3);
-    showOut("删 L1 后裸 rowOf(L3) = " + std::to_string(r) + "(真值 0,陈旧值 1)");
-    check(r == 0, "★② 裸 rowOf(L3)=0:静默变更后快路径不吃陈旧账本(R1)");
+    showOut("notifyRemove+删 L1 后裸 rowOf(L3) = " + std::to_string(r) + "(真值 0,陈旧值 1)");
+    check(r == 0, "★② 裸 rowOf(L3)=0:通知即新鲜,无需预热查询(v4 契约)");
     GuiBase* par = P.parentOf(l3);      // 裸 parentOf 同样必须新鲜
     check(par && P.isGroup(par) && P.childCount(par) == 1,
           "③ 裸 parentOf(L3)=GA 且 GA 只剩 1 员");
@@ -1037,15 +1052,15 @@ static void t23_nodePageCleanup() {
     });
     sp.opt.dynamicAll = true;
     P.install(flat, sp, {});
-    (void)P.childCount(flat);           // 建索引:flat 2 组 + 4 成员 = 6 条
-    size_t before = P.memoryBreakdown().nodePage;
-    showIn("页装投影并建索引,nodePage 基线 = " + std::to_string(before));
+    (void)P.childCount(flat);           // 建索引:flat 2 组 + 4 成员 = entries 6 条
+    size_t before = P.memoryBreakdown().entries;
+    showIn("页装投影并建索引,entries 基线 = " + std::to_string(before));
 
     P.uninstall(flat);
-    size_t after = P.memoryBreakdown().nodePage;
-    showOut("uninstall 后 nodePage = " + std::to_string(after) + "(应减少 6)");
+    size_t after = P.memoryBreakdown().entries;
+    showOut("uninstall 后 entries = " + std::to_string(after) + "(应减少 6)");
     check(before >= 6 && after == before - 6,
-          "★拆页清掉全部 6 条位置索引(旧 bug:只清 2 条、泄漏 4 条)");
+          "★拆页清掉全部 6 条位置索引(v4:entries 随页析构,结构上不可能泄漏)");
 
     P.unregisterRoot(root);
     P.collectGarbage();
@@ -1063,7 +1078,7 @@ int main() {
     t7_endToEnd(); t8_cache(); t9_rowOf(); t10_evaporate(); t11_multiLayer(); t12_deathOfOwner();
     t13_prune(); t14_rebind();
     t15_model(); t16_signals();
-    t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_epochEscapeHatch();
+    t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_paranoidAndHeal();
     t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup();
     printf("\n══════ 汇总:%s(失败块数 = %d,即退出码)══════\n",
            g_fail ? "有 FAIL" : "23 块全绿", g_fail);

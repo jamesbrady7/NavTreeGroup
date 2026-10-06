@@ -15,9 +15,10 @@
 > `[实测]` = 跑过命令/探针,有输出证据 · `[读码]` = 只做过源码审读,未独立运行验证
 > · `[论证]` = 只有推理,无实证(必须写出"为什么暂时无法实证")
 >
-> 最后更新:**第三方评审(2026-10-06 入网前检视)** —— 探针实证并修复 R1(裸坐标陈旧,高危)/
-> R2(m_nodePage 泄漏,中危)/R3(组上求值 locate,低危);回归固化 T22/T23 + probe_review 目标。
-> 此前:实现方(第三轮)§5 缺口清单全部关闭(#1/#2/#3/#4/#6 + ASan 替代实证)。
+> 最后更新:**v4 重构(2026-10-07,perf-round2 分支)** —— 脏通知契约取代惰性发现,
+> 删除纪元/位图/双位置索引整套加速机械;设计全文见 **docs/重构v4_脏通知.md**,
+> 性能/内存对比见 §3,契约变化见 C5(v4)/C8(作废)。
+> 此前:第三方评审(2026-10-06)修复 R1/R2/R3;实现方(第三轮)§5 缺口全关闭。
 > 改动请在此追加一行"变更记录"。
 
 ---
@@ -157,12 +158,21 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 - 移植结论:**内存预算按"换规则/删组那一刻的组数 × sizeof(TreeGroup)"算**,
   不必为 `rebuild` 通道额外留量;再留 ~12% 余量即可。
 
-**C5 —— 纪元闸门的正确性依赖"单线程 + 一次操作内数据不变"。** `[实测]`
-闸门在 `treeprojection.cpp`(条件:`m_epochOptimOn && p.checkedAt == m_queryEpoch && p.valid` → return),
-纪元由 `EpochScope` 维护(只有最外层递增)。
-- **前提**:数据侧变更必须经过引擎 API,或与引擎无交互(即单线程同步语义)。
-- 违反后果:**不崩溃**,只产生**静默陈旧投影**(视图显示已不存在的行)—— 最难查的一类。
-- **✔ 现已有正式开关(不再是只有注释)**:见下方"纪元优化的逃生阀"。
+**C5 ——(v4 重写)脏通知契约:数据变更必须通知,漏通知由卫生边界自愈。** `[实测]`
+~~纪元闸门(EpochScope/checkedAt/setEpochOptimization/crossThreadEntryCount)~~ **已于 v4 整体删除**。
+v4 的缓存检查只有一行:`revalidate` 开头 `if (p.valid && !p.dirty) return;`。
+- **契约**:数据侧结构变更后调 `invalidate(parent)` / `notifyRemove(parent,dying)`(必须在 delete 前)/
+  属性变更后调 `invalidateNode(node)` / 大变更后 `invalidateAll()`。
+  通知只置脏(O(1),批量天然合并),重算发生在下次读。
+- 违反后果:**不崩溃**,产生**静默陈旧投影** —— 但有三层兜底:
+  ① `prune`/`rebind`/`install`/`refresh` 的 DFS 对每个账页 healIfDrift(枚举 vs lastLive,
+  漂移→置脏重算,**双配置都跑**)⇒ 陈旧最多活到下一次卫生边界;
+  ② paranoid 漏报检测(默认 Debug 开,`setParanoidChecks`):childCount 对干净页额外比对,
+  漂移 → stderr 点名漏报 owner + 当场自愈(只对【干净】页比对,已通知的脏页不誤报);
+  ③ `structRev()` 精准操作前后取值比对(C9 不变)。
+- **单线程前提不变**(与 QAbstractItemModel 同级):引擎无锁;跨线程改数据树 = 调用方违约。
+  ~~逃生阀 setEpochOptimization(false)~~ 随纪元机制删除 —— v4 没有"可关掉的优化",
+  只有"必须遵守的通知契约"。回归:**T20(v4)** paranoid+prune 双自愈;**T22(v4)** 通知即新鲜。
 
 **C6 —— 组不存成员;成员关系的唯一存储处是账页的 `p.members`。** `[读码]`
 `TreeGroup` 只持有 `m_ticket` + `m_owner`(`class TreeGroup` 的成员区);成员靠
@@ -172,13 +182,10 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 `TreeProjection::freshMembers` 返回 `&mit->second`,不拷贝。所有调用点必须"取得即用"。
 - 安全性依据(节点式容器):`unordered_map` rehash **只失效迭代器,不失效元素引用** `[论证]`。
 
-**C8 —— 提示位图 `m_pageHint` / `m_groupHint` 只置位、从不清除,且置位点唯一。** `[实测]`
-建页点唯一:`TreeProjection::projection()` 内的 `hintMark(m_pageHint, parent)`;建组点唯一:`revalidate` 里 `new TreeGroup` 旁的 `hintMark(m_groupHint, ng)`。
-容量定长 `2^23` 位 = 1 MB/张(`TreeProjection::HINT_BITS_LOG2`)。
-- 失效方向是安全的:只可能"多算"(白做一次探测),**唯一危险是漏置位**。
-- ⚠ **本项有实测教训**:验证方曾误判 `projection()` 里那行 `hintMark(m_pageHint, parent)` 为死代码并删除 →
-  `interactive_demo` 的 **M 用例立刻 FAIL**(`prune` 的 DFS 用 `m_pageHint` 门控"有无账页"探测,
-  漏置位 ⇒ 活页被当僵尸删掉)。**此行使勿删。**
+**C8 ——(v4 作废)提示位图已整体删除。** ~~`m_pageHint`/`m_groupHint` 只置位、从不清除,置位点唯一~~
+位图是 prune DFS 的微优化(省 60~80ms/百万节点),代价是 2MB 常驻 + "建页点唯一、漏置位=活页被当僵尸删"
+这条易碎不变量(曾出过 M 用例事故)。v4 权衡:**边界操作省几十毫秒不值一条隐形契约** → 删除,
+prune 直接查 `m_byParent`(unordered_map,O(1))。本条保留作推翻痕迹(§6.5 纪律)。
 
 **C9 —— 失步自检:`structRev()` 的读法。** `[实测]`
 递增点 `revalidate` 末尾的 `++m_structRev`(条件:`deleted` 非空 或 flat 行数变 或 组数变)。
@@ -245,7 +252,11 @@ clean build 双配置结果:**0 错误 0 警告**。
 所以剩下的 28 处 C4819 **全部只在输出文本/注释里**,不影响任何逻辑 → 豁免合理。
 ⚠ 但新增源文件仍须保证**合法 UTF-8**(编译期由 `/utf-8` 保证,运行时输出由 `CP_UTF8` 保证)。
 
-### 1.7 纪元优化的逃生阀(契约 C5 的正式开关)`[实测]`
+### 1.7 ~~纪元优化的逃生阀~~(v4 已删除整节机制,保留标题作推翻痕迹)
+
+> **v4 注**:纪元机制(EpochScope/checkedAt/开关/跨线程检测)已整体退役,
+> 替代物是 C5 的脏通知契约 + `setParanoidChecks(bool)`(漏报检测,非性能开关)。
+> 以下为历史原文,仅供理解旧版本:
 
 前提不成立(你们的模型跨线程/异步改数据树)时,现在有**正式的运行时开关**,不用改源码:
 
@@ -309,7 +320,10 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 2. **`revalidate` 内只准用 `rawChildren`**,不得调公共 `childCount`(否则"对组分组"无限递归)。
 3. **绑定谓词不对组节点求值**(`if (!isGroup(n) && b.locate(n))`),否则无限嵌套。
 4. **落位时必须剔除本轮已删的旧组**(`deleted` 集合),否则野指针进 `flat`。
-5. **建页必置位**:新增任何建页路径都必须走 `TreeProjection::projection()`。
+5. ~~**建页必置位**(提示位图)~~ **v4 作废**:位图已删除,建页无附加义务(仍走 `projection()`)。
+   **v4 新增:数据变更必配对通知** —— 一切绕过引擎的数据侧增删都要有
+   `invalidate`/`notifyRemove`/`invalidateNode` 配对(delete 之前调);
+   收口点模式见 interactive_demo 的 `createAndAttach`/`deleteChildRaw` 包装。
 6. **`m_retired` 的清理只在 `collectGarbage()`,且只在 begin/end 之内。**
 7. **`memberToGroup` 只存本层**(刻意无全局版,多层会互相覆盖)。
 8. **投影引擎是进程级单例**(`TreeProjection::instance()`),多文档共享一套 keyspace;
@@ -328,22 +342,28 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 > 机器:验证方本机(Release)。**换机器请重新采基线,不要把绝对值当回归阈值**,
 > 而应看同一台机上的相对变化。
 
-| 场景 | 实测 | 说明 |
-|---|---|---|
-| `build-1M`(数据侧建树,引擎无关) | ~112 ms | 1,010,101 节点 |
-| `cold-bind`(bindSpec+rebind 装 1 万父) | **~523 ms** | 含全树 DFS + prune(区间 495~527,机器噪声 ±10%) |
-| `rowcount-cache-hit` | ~390-640 ns/op | 模型 `rowCount` 热路径(区间噪声大) |
-| `parentOf+rowOf` | **~1340 ns/op**(R1 后实测) | ⚠ 改造中期曾报 ~959 ns/op —— 那个数字靠"快路径不开纪元"的不健全跳过换来(R1 陈旧坐标 bug),已随修复作废;现值仍优于索引化前的 ~2440 |
-| `model-full-dfs` | 1,110,100 节点 | 投影后含组,>原始节点数 |
-| `rebuild-channel` | **~1006 ms** | wipe 115 + 重建 69 + prune冷 641 + walk 181 |
-| `prune-1M` | **~130 ms** | 全树可达性剪枝(区间 120~140) |
-| `wide-install-200k` | ~200 ms | 单父 20 万孩子 |
-| `bench` TOTAL | **~3.9 s** | 位置索引建表带来约 +1.1 s(百万节点量级一次性成本) |
-| 峰值工作集 | **~496 MB** | 1M 数据节点 166 MB + 引擎账本 **228.6 MB**(含位置索引 140 MB)+ 组本体 ~9 MB |
-| 账本内存分解 | **228.6 MB / 百万被投影节点** | `memberToGroup` 54.1 + **`memberToPos` 74.3** + **`m_nodePage` 65.9** + 其余 |
-| 读侧最宽层 k | 遍历 k 行的代价 | **仍是超线性**:每次模型查询重开纪元 ⇒ 页校验无法跨调用跳过(见下节) |
+| 场景 | v3(评审轮后) | **v4(脏通知,2026-10-07)** | 说明 |
+|---|---|---|---|
+| `build-1M`(数据侧建树,引擎无关) | ~112 ms | ~156 ms | 机器噪声量级 |
+| `cold-bind`(bindSpec+rebind 装 1 万父) | ~938 ms | **~626 ms** | 含全树 DFS + prune |
+| `rowcount-cache-hit` | ~394 ns/op | **~62 ns/op** | ★6.3×:干净页 = 一次哈希 + 脏标志,零枚举 |
+| `parentOf+rowOf` | ~1342 ns/op | **~867 ns/op** | locate 下钻 O(深度) 哈希(随机访问 1M 树,含 cache miss;v3 中期 959 那个数字靠不健全跳过换来,已作废) |
+| `model-full-dfs`(111 万 index) | ~925 ms | **~359 ms** | ★2.6× |
+| `rebuild-channel` | ~1750 ms | **~1123 ms** | wipe 95 + rebuild 65 + prune冷 684 + walk 279 |
+| `prune-1M` | ~113 ms | **~202 ms** | ⚠ 变贵是【故意的】:prune 兼职"漏通知自愈"(每页 healIfDrift 枚举比对)—— 卫生边界买正确性兜底 |
+| `wide-rowOf`(20 万孩子父) | ~230 µs/次 | **~75 ns/次** | ★3000×:entries 直接答行号 |
+| `wide-install-200k` | ~710 ms | **~300 ms** | |
+| `install-loop`(反例) | ~576 ms/install | ~204 ms/install | 仍是 N×install 禁忌的实证(每次内嵌全树 prune) |
+| 引擎账本 | **228.6 MB** | **108.6 MB** | ★省 52%:三表(memberToGroup 54.1 + memberToPos 74.3 + m_nodePage 65.9)→ 单表 entries 74.3;位图 2MB 也删了 |
+| 峰值工作集 | ~489 MB | **~316 MB** | 数据 166 + 账本 108.6 + 组本体 ~9 + 碎片 |
+| 跨调用 O(k²) | **未消除** | **根除** | T21:600 宽页全树 parentOf+rowOf,Debug **13 s → 1.06 ms**;根治手段正是数据侧信号(C5 v4 通知契约) |
+| `gcstress` | ✓ | ✓ WS +1.1 MB | 200 轮双路径,Debug `_CrtCheckMemory` 0 失败 |
 
 ### 读侧位置索引(2026-10-06 落地):拿到了什么、没拿到什么
+
+> **⚠ v4 注(历史小节)**:本节的 `memberToPos`+`m_nodePage` 双表已被 v4 的**单表 `entries`**
+> (每页 `node→{投影父亲,行号}`,无全局副本)取代;"跨调用 O(k²) 未消除"的诚实结论已被
+> **脏通知契约**(C5 v4)解决 —— 干净页零枚举,行号/父亲直接查表。下文保留作演化痕迹。
 
 **问题**(实测):模型对每一行都问 `parentOf`/`rowOf`,旧实现为给答案必须
 `revalidate` → `liveMatchesLast` **枚举该页全部孩子**。而**每次模型调用都是一个独立操作
@@ -407,7 +427,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 3. **超深链:引擎 DFS 已全部显式栈迭代化**(`bench deep` 10 万深链 PASS),但
    **`~GuiBase` 的连坐析构仍是递归的** —— 深度 >3 万级时 `delete root` 本身会爆栈。
    这是冻结架构的属性,改引擎解决不了。
-4. **单线程约束**:见 C5。跨线程/异步改数据树时禁用纪元优化。
+4. **单线程约束 + 通知契约**:见 C5(v4)。数据变更必须配对通知;跨线程改数据树 = 违约(引擎无锁,与 QAbstractItemModel 同级假设)。
 
 ---
 
@@ -419,7 +439,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 | `navtree_demo` | 退出码 0,不变量通过 | ✔ 通过 |
 | `gui_demo` | 退出码 0 | ✔ 模型不变量 13 项 + 终检 10 项 |
 | `tree_tabs --selftest` | `selftest PASS` | ✔ |
-| `interactive_demo --selftest` | `selftest PASS` | ✔ **38 条全绿**(A~Q) |
+| `interactive_demo --selftest` | `selftest PASS` | ✔ **62 条 [OK] 全绿**(A~S;v4 迁移后,Q 电池改走通知契约,断言主体不变) |
 | `bench` | `CHECK` 全 OK、teardown 零泄漏 | ✔ CHECK 失败=0 |
 | `bench deep` | PASS(无栈溢出) | ✔ depth 100000 |
 | `bench dbg` | 无 MISSING | ✔(注意:其"address reuse"统计的是**叶子**地址复用,与组回收无关) |
@@ -460,7 +480,9 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
   **N/O** 多层后深层再建组、**P** 三层嵌套收组失败、**Q** 读侧不释放组。
 - `unit_tests`:**T17** 读侧不释放组契约、**T18** Tester(查账本自洽)+ `rowsAboutToBeRemoved`
   参数断言(查信号坐标,**Tester 自己查不了这个**)、**T19** 多层级联(含分辨力自检)、
-  **T20** 纪元逃生阀(开/关投影树逐项相同)。
+  **T20(v4)** 漏通知检测与自愈(paranoid 开=childCount 当场自愈;关=陈旧至 prune 边界)、
+  **T21** 宽节点读侧(v4:双配置毫秒级,阈值 Release 2s/Debug 30s 只防真爆炸)、
+  **T22(v4)** 通知即新鲜(notifyRemove 后裸 rowOf 无需预热)、**T23(v4)** entries 随页同生共死。
 - `interactive_demo`:**R 电池(压力树)** + **S 电池(控制台)** —— 会话内自建一棵极端复杂树
   (宽 500 直属孩子 / 24 层深链 / 三政体 / 三个同名"轴承" / 空组)并断言:535+ 节点的
   **全树不变量**、无 flat 重复、深链 24 层、宽父亲收敛成 10×50、多根隔离、同名节点各归本层、
@@ -577,3 +599,4 @@ gcstress-x200  200 轮(含 prune 剪枝路径 100 轮) | 残留待回收累计=0
 | **2026-10-06(第三方评审:入网前检视,发现并修复 R1/R2/R3)** | 评审方独立复验(clean build 双配置 0 错误 0 警告;15 项回归 exit 全 0;日志无 FAIL/CHECK!/MISMATCH)+ 写探针 `probe_review.cpp` 实证三个读码疑点。**坐实并修复三处**:① **R1(高危,正确性)**:`parentOf`/`rowOf` 的位置索引快路径在 `EpochScope` 之前执行 → 裸调用不递增纪元 → 快路径内 revalidate 把"上一操作校验过"误当"本操作校验过",数据侧静默变更后返回**陈旧坐标**(探针实证:删 L1 后裸 `rowOf(L3)` 答 1,真值 0)。生产触发面:连续多次精准删除之间无 rowCount 调用时,`beginRemoveRows` 拿到含死者的旧行号(gui_demo 因 Op 间有 dumpModel 而从未暴露)。修复 = 纪元在快路径前开(每操作首触页必重枚举,同操作内仍 O(1))。代价:`parentOf+rowOf` 959→**1342 ns/op**(旧值靠不健全跳过,作废);T21 Debug 诚实成本 ~13 s → **阈值改分配置**(Release 2 s/Debug 30 s,护栏仍能抓 ×600 的真爆炸)。② **R2(中危,内存)**:`dropProjection` 的 `m_nodePage` 清理键集收的是 flat+members 的**组键**(kv.first),漏掉各组成员(kv.second)→ 探针实证 6 条只清 2 条;答案正确性靠快路径查空回退兜底,但条目随组变更单调积累。修复 = 清理直接遍历 `memberToPos` 键集(与登记循环对称同源,不可能再漂移)。③ **R3(低危,契约字面)**:`walkBindings` 条件 `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` 会对组节点**求值 locate**(探针实证 4 次)——违反不变量#3 的字面承诺,用户 locate 若对组做无防御 cast 即 UB。修复 = 先判非组再求值(位图门控收益保留)。回归固化:新增 **T22**(裸坐标新鲜度,分辨力:去掉 R1 修复必红)/ **T23**(拆页清理,分辨力:换回旧写法必红);`probe_review` 加入构建(第 7 目标)。**修复后全绿**:23 块 × 双配置、七目标回归、probe 0 confirmed、bench all/deep/dbg/gcstress/mem/regroup/cold-prune × 双配置 exit 全 0 | `[实测]` 探针修复前:P1 CONFIRMED(stale 1≠0)/P2 CONFIRMED(2/6)/P3 CONFIRMED(4 次);修复后全 OK |
 | **2026-10-06(验证方补:启动即进压力树 + 形态澄清)** | 用户反馈"没看出是改造后的树"。**澄清:代码本来就是 model–view 形态**(`QTreeView` + `NavTreeModel : QAbstractItemModel`,模型只经 `ITreeSource` 读引擎,回归里有 `QAbstractItemModelTester`)。真正的问题是**压力树要手点按钮才出现**,默认看到的是初始树。修正:①**启动即构造压力树并切到它**(交互态无需点按钮);②控制台改为"显示压力树 / 显示初始树"**视图切换**(模型换 root,引擎同一套);③拆树后自动切回初始树(否则模型挂着已删 root);④主程序收尾补充压力树的政体感知清理;⑤新增 **`--smoke` 冒烟模式**,无头打印"界面此刻该显示什么"并点一次规则按钮 —— 实测 `模型 root = 压力装配体 / 存活组 = 18 / 根层 8 行 / 按钮 9 个`,切按类型后 `存活组 5 / 根层 5 行` | `[实测]` 双配置 **0 错误 0 警告**;六目标 × 双配置 + `--smoke` 全 exit 0;`bench all` × 双配置 `CHECK!=0` |
 
+| **2026-10-07(v4 重构:脏通知契约 —— 用户拍板"放宽使用侧")** | 动机(用户):优化机械堆叠让代码杂乱难懂,进内网后无大模型支持难调试,且跨调用 O(k²) 仍未解决;愿意由使用侧承担"告诉引擎何时脏、哪里脏"的契约。设计与全部决策记录见 **docs/重构v4_脏通知.md**。**删除**(整套"猜数据变没变"的机械):纪元闸门(EpochScope/checkedAt/setEpochOptimization/跨线程检测)、liveMatchesLast 就地比对、全局 m_nodePage、每页 memberToPos、提示位图 m_pageHint/m_groupHint(C8 作废)。**新增**:①通知 API `invalidate/invalidateNode/notifyRemove/invalidateAll`(O(1) 置脏,批量天然合并);②每页 `dirty` 标志 —— 缓存检查塌缩成一行 `if (p.valid && !p.dirty) return;`;③单表 `entries`(node→{投影父亲,行号},合并 memberToGroup+memberToPos,随页同生共死 → R2 类泄漏结构上不可能);④`locate()` 统一下钻(parentOf/rowOf 共用);⑤三层漏通知兜底:prune/rebind 自愈(healIfDrift,双配置)+ paranoid 漏报点名(默认 Debug,`setParanoidChecks`,**只对干净页比对** —— 首版把已通知的脏页也点名,9 条误报,已修)+ structRev。**保留**:m_retired/collectGarbage(C1)、structRev(C9)、PtrSet、bindGen 豁免(简化为"同绑定→跳过")、pipeline 七纯函数(buildFlat 改收 entries+owner)、组页自拆回查防护、异常安全闸门(valid 末尾置位,重算开始即撤销)。**迁移**:tests(T5/T8/T10/T16~T23;T20 换"漏报自愈"、T22 换"通知即新鲜"、T23 换 entries;新增"DataObject 构造不自动挂父"踩坑注释)、五 demo(收口点:createAndAttach/deleteChildRaw 包装自动通知;removeWithSignal/t5Remove 插 notifyRemove;S4/S8/Q 电池按新契约改写)、bench(incremental/dbg/gcstress 补通知;rebuild 通道**刻意保持静默**以压测 prune 自愈路径)、probe_review(三探针按 v4 契约重写,含"违约→陈旧→prune 自愈"负面验证)。**已知口径**:verifyGroups"应有组"在多层嵌套下按注册表计数,外层吞内层时顶层组数更小(M 电池"应有2 实际1"日志 v3 时代即如此,非失败,已加注释);prune-1M 113→202ms 是自愈比对的故意成本 | `[实测]` **七目标×双配置 exit 全 0、0 警告**;unit_tests 23 块×双配置;interactive 62 [OK]+--smoke;bench 全模式(all/deep/dbg/gcstress/cold,mem/cold,regroup/cold,prune)×双配置 CHECK=0;probe 0 confirmed(P1a 通知即新鲜/P1b 违约自愈/P2 entries 随页/P3 组上零求值);性能:rowcount 6.3×、wide-rowOf 3000×、model-dfs 2.6×、账本 −52%、跨调用 O(k²) 根除(T21 Debug 13s→1.06ms),对比表见 §3 |

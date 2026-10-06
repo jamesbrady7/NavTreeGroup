@@ -157,22 +157,28 @@ inline void sortMembers(std::map<TreeGroup*, std::vector<GuiBase*>>& members,
 
 // ── flat 落位 ────────────────────────────────────────
 // 职责:把"组"放回它第一个成员原本的位置,直属节点原位不动。
-// 输入:vis           = 过滤后的数据侧顺序
-//       memberToGroup = 成员 → 组
+// 输入:vis     = 参与名单(数据节点 + 旧组,已按槽位排好)
+//       entries = 本页位置表(v4 单表);★ 调用时机在"阶段①成员行已建、
+//                 阶段②flat 行未建"之间,故此刻 entries 只含【成员→组】映射
+//       owner   = 本页父亲(区分"直属顶层项 container==owner"与"被分组 container==组")
 // 输出:flat(未排序)= 组与直属混排的序列,长度 = vis 中"直属数 + 组数"
 inline std::vector<GuiBase*> buildFlat(const std::vector<GuiBase*>& vis,
-                                       const std::unordered_map<GuiBase*, TreeGroup*>& memberToGroup) {
+                                       const std::unordered_map<GuiBase*, PosEntry>& entries,
+                                       GuiBase* owner) {
     std::vector<GuiBase*> flat;             // 输出:组+直属混排的序列(未排序)
     std::set<TreeGroup*> placed;            // 已落位的组:每个组只进 flat 一次
-    // 代表(rep):沿 memberToGroup 上溯到【最外层】组。多层分组时,内层成员的
+    // 代表(rep):沿 entries.container 上溯到【最外层】组。多层分组时,内层成员的
     // 本层代表是最外层祖先组(Base→Steel组→外层组 ⇒ root 层落"外层组"),
     // 否则内层组会被错误地再落一份到本层。
+    // 终止:① 查到某层 container==owner → 它已是顶层直属项;
+    //       ② entries 查无(阶段①只登记成员,顶层组/直属数据节点不在其中)→ 它自己就是代表。
     auto rep = [&](GuiBase* n) -> GuiBase* {
         GuiBase* cur = n;
         for (;;) {
-            auto it = memberToGroup.find(cur);
-            if (it == memberToGroup.end()) return cur;
-            cur = it->second;
+            auto it = entries.find(cur);
+            if (it == entries.end()) return cur;
+            if (it->second.container == owner) return cur;
+            cur = it->second.container;
         }
     };
     for (GuiBase* node : vis) {             // 按参与名单顺序逐个扫

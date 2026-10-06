@@ -103,6 +103,7 @@ static TreeGroup* findGroup(GuiBase* parent, const std::string& key) {
 static void removeWithSignal(NavTreeModel& model, DataObject* owner, DataObject* victim) {
     GuiBase* par = P.parentOf(victim);            // ① 死前问坐标(投影账本)
     if (!par || P.rowOf(victim) < 0) {            // ② 被过滤/不在投影树 → 零信号直接删
+        P.notifyRemove(owner, victim);            // ★v4:被过滤≠不通知(它占着原始活列表)
         owner->destroySubDataGroup(victim);
         return;                                   // 被滤节点不在投影树上,形状不会变
     }
@@ -112,11 +113,13 @@ static void removeWithSignal(NavTreeModel& model, DataObject* owner, DataObject*
     const size_t revBefore = model.src().structRev();   // ★ 坐标查询全部做完,取基线
     if (cas) {
         model.beginRowRemoval(P.parentOf(cas), P.rowOf(cas));
-        owner->destroySubDataGroup(victim);       // 引擎下次查询时自动拆掉空组
+        P.notifyRemove(owner, victim);            // ★v4:通知在 delete 前、坐标查询后
+        owner->destroySubDataGroup(victim);       // 下次查询按脏标志重算,空组自动拆掉
         model.endRowRemoval();
     } else {
         int row = P.rowOf(victim);                // ④ 普通情形:成员行,组存活
         model.beginRowRemoval(par, row);
+        P.notifyRemove(owner, victim);            // ★v4 通知
         owner->destroySubDataGroup(victim);
         model.endRowRemoval();
     }

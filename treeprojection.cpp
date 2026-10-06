@@ -2,7 +2,7 @@
 #include "pipeline.h"
 #include <algorithm>
 #include <cstdint>      // SIZE_MAX
-#include <unordered_map>
+#include <cstdio>       // fprintf(stderr) —— paranoid 漏报点名
 
 // ═══════════════════════════════════════════════════════════════
 //  TreeGroup:成员枚举全部委托引擎 → 自身无状态、无指针可悬空
@@ -45,14 +45,11 @@ size_t TreeProjection::liveGroupCount() const {
 }
 
 // 账本内存分解:只读遍历,不改任何状态。
-// 字节口径(重要,别拿这些数字去和 sizeof 累加对比):
-//   · 哈希表(成员标注的 unordered_map)= 桶数组(capacity×8) + 节点(n×24~32 含 malloc 头)
-//   · std::map = n×48(红黑头 3 指针 + 颜色 + pair)
-//   · vector = capacity×8
-//   · 组成员向量按 capacity 算(不是 size —— 预留过的槽位是真占内存的)
+// 字节口径:哈希表 = 桶数组(capacity×8) + 节点(n×24~32 含 malloc 头);
+//          std::map = n×48;vector = capacity×8;组成员向量按 capacity 算。
 TreeProjection::MemBreakdown TreeProjection::memoryBreakdown() const {
     MemBreakdown mb;
-    size_t specPerPage = 0;   // 每页 spec 的估算字节(所有页同构,取一次即可)
+    size_t specPerPage = 0;
     auto hashBytes = [](size_t n, size_t nodeBytes) {
         size_t buckets = 16; while (buckets < (n ? n * 2 : 1)) buckets <<= 1;  // ~0.5 负载
         return buckets * 8 + n * nodeBytes;
@@ -65,36 +62,24 @@ TreeProjection::MemBreakdown TreeProjection::memoryBreakdown() const {
         mb.flatPtr += p.flat.capacity();
         mb.memberGroups += p.members.size();
         for (const auto& mk : p.members) mb.memberPtr += mk.second.capacity();
-        mb.memberToGroup += p.memberToGroup.size();
-        mb.memberToPos += p.memberToPos.size();      // 位置索引:与 memberToGroup 同量级
+        mb.entries += p.entries.size();          // ★ v4 单表(替代 memberToGroup+memberToPos)
         mb.groupsVec += p.groups.capacity();
-        // spec:三个 std::function(各 32B)+ 两个空 string(各 32B)+ opt(≈8B)+ 动态块的堆头
         if (specPerPage == 0) {
             specPerPage = 32 * 3 + 32 * 2 + 8 + 16;
-            if (p.spec.filter || p.spec.grouping || p.spec.less) specPerPage += 64;  // 捕获闭包
+            if (p.spec.filter || p.spec.grouping || p.spec.less) specPerPage += 64;
         }
     }
     mb.groupOwner = m_groupOwner.size();
-    // Projection 本体在节点里;桶数组按"负载 0.5"估
-    mb.pageObjBytes = hashBytes(mb.pages, sizeof(void*) * 2 + 8 + 232);   // 节点:next+key+val(232B Projection)+ 头
+    mb.pageObjBytes = hashBytes(mb.pages, sizeof(void*) * 2 + 8 + 232);
     mb.specBytes = mb.pages * specPerPage;
     mb.lastLiveBytes = mb.lastLivePtr * 8;
     mb.flatBytes = mb.flatPtr * 8;
-    // p.members: map 节点(含 group key + vector 24B) + 每个成员向量的堆内存
     mb.membersBytes = mb.memberGroups * 48 + mb.memberPtr * 8 + mb.memberGroups * 16;
-    mb.memberToGroupBytes = hashBytes(mb.memberToGroup, 8 + 8 + 8 + 16);  // next+key+val+头
-    // memberToPos:每槽 = key(8) + pair<GuiBase*,int>(16,含 padding) = 24B 净,加节点头 ~16B
-    mb.memberToPosBytes = hashBytes(mb.memberToPos, 8 + 16 + 16);
-    // m_nodePage:节点 → 页,每槽 = key(8) + val(8) + 头 16
-    mb.nodePage = m_nodePage.size();   // 直接取,别用 memberToPos 估(两者可能不等)
-    mb.nodePageBytes = hashBytes(mb.nodePage, 8 + 8 + 16);
+    // entries:每槽 = key(8) + PosEntry(16) + 节点头(16)
+    mb.entriesBytes = hashBytes(mb.entries, 8 + 16 + 16);
     mb.groupsBytes = mb.groupsVec * 8;
     mb.groupOwnerBytes = hashBytes(mb.groupOwner, 8 + 8 + 8 + 16);
-    mb.groupObjBytes = mb.groupOwner * 96;   // TreeGroup: vptr+GuiBase(2 ptr+2 vec=40)+ticket(2 string=64)+owner
-    // ── 延迟释放的代价(C4 的直接证据)────────────────────────────
-    // 关键点:retiredGroups 用【当前值】,retiredHighWater 用【引擎记的峰值】。
-    //   峰值出现在重建中途(组被淘汰但还没 collectGarbage),事后采样 current
-    //   会看到 0 —— 这正是原缺口"未纳入基准"的原因:不是忘了测,是采不到。
+    mb.groupObjBytes = mb.groupOwner * 96;   // TreeGroup 本体估算
     mb.retiredGroups = m_retired.size();
     mb.retiredHighWater = m_retiredHighWater;
     mb.retiredBytes = mb.retiredGroups * 96;
@@ -105,12 +90,10 @@ TreeProjection::MemBreakdown TreeProjection::memoryBreakdown() const {
 std::vector<TreeGroup*> TreeProjection::install(GuiBase* parent, const ProjectionSpec& spec,
                                                 std::vector<GuiBase*> siblings)
 {
-    EpochScope epoch(this);   // 写侧同样是操作边界:新纪元 → 不吃上一轮的 checkedAt
-    prune();   // 操作边界自动自愈(清僵尸投影;批量 delete+new 后尤其重要)
+    prune();   // 操作边界自动自愈(清僵尸投影 + 漏通知收敛;批量 delete+new 后尤其重要)
     return installInternal(parent, spec, siblings);
 }
 
-// 兼容旧接口:只装分组
 std::vector<TreeGroup*> TreeProjection::apply(GuiBase* parent, const std::vector<GuiBase*>& siblings,
                                               GroupRule rule, Options opt)
 {
@@ -124,16 +107,14 @@ std::vector<TreeGroup*> TreeProjection::installInternal(GuiBase* parent, const P
                                                         const std::vector<GuiBase*>& siblings)
 {
     if (!parent) return {};
-    Projection& p = projection(parent);   // m_byParent 是节点式 unordered_map:
-    //   标准保证 rehash 只失效迭代器、【不失效元素引用】,所以下面一路持有的
-    //   Projection& 在任何插入(含嵌套 installInternal 触发的建组)下都安全。
+    Projection& p = projection(parent);   // unordered_map 节点式:引用在任何插入下稳定
     p.spec = spec;
     // 手动安装:抹掉绑定出身(此页从此按"手动 Spec"对待,rebind 不再豁免它)
     p.bindId.clear();
     p.bindGen = ~0u;
 
     // 分组参与名单消毒(仅 !dynamicAll 时有意义):
-    //   nullptr/parent 自己/重复 → 剔除;"别人家的孩子"无需判(不在活枚举里,天然无效);
+    //   nullptr/parent 自己/重复 → 剔除;"别人家的孩子"不在活枚举里天然无效;
     //   ★ 输入含本父亲的旧组 → 展开为其当前活成员(否则换规则时组内成员全体失踪)
     p.pool.clear();
     if (spec.grouping && !spec.opt.dynamicAll) {
@@ -153,15 +134,65 @@ std::vector<TreeGroup*> TreeProjection::installInternal(GuiBase* parent, const P
     }
 
     p.valid = false;          // 强制重算
-    p.checkedAt = 0;          // ★ 纪元闸门要一起作废(否则 valid=false 仍会被纪元短路)
+    p.dirty = true;
     revalidate(parent, p);
     return p.groups;
 }
 
+// ══ ★数据侧变更通知(v4 契约)══════════════════════════════
+//  通知 = 置脏标志,O(1),不触发重算(批量变更天然合并到下次读)。
+
+void TreeProjection::invalidate(GuiBase* parent) {
+    if (!parent) return;
+    auto it = m_byParent.find(parent);
+    if (it == m_byParent.end()) return;   // 无页 = 没人投影它的孩子列表(透传读永远现场新鲜)
+    it->second.dirty = true;
+    markGroupPagesDirty(parent);          // 组成员表源自本页 → 名下组页连坐置脏(传递)
+}
+
+void TreeProjection::invalidateNode(GuiBase* node) {
+    if (!node) return;
+    // 节点属性的消费方是它【投影父亲】所在的页 = 自然父亲的页(组页由传递置脏连坐)。
+    // 自然父亲没页 = 没有页按它的属性分组/过滤/排序它 → 无事发生。
+    GuiBase* p = dynamic_cast<TreeGroup*>(node)
+               ? static_cast<TreeGroup*>(node)->owner()
+               : node->parentForTree();
+    invalidate(p);
+}
+
+void TreeProjection::notifyRemove(GuiBase* parent, GuiBase* dying) {
+    // 顺序无强约束,但都必须在 delete dying 之前:
+    invalidate(parent);   // 孩子列表脏(下次读重算,死者自然缺席)
+    discard(dying);       // dying 自己的账页(若有)当场拆掉;其内部页变僵尸由 prune 清
+}
+
+void TreeProjection::invalidateAll() {
+    for (auto& kv : m_byParent) kv.second.dirty = true;
+}
+
+// 把 parent 名下(传递)所有"有自己账页"的组置脏。
+// 为什么必须传递:组页的活列表 = owner 成员表;owner 变 → 组页输入变。
+// 若只在 owner 重算时传播(revalidate 末尾也有一份),会出现
+// "owner 已置脏但还没人读,先读组页 → 组页干净 → 答陈旧 flat"的窗口。
+void TreeProjection::markGroupPagesDirty(GuiBase* parent) {
+    auto it = m_byParent.find(parent);
+    if (it == m_byParent.end()) return;
+    PtrSet seen;
+    std::vector<GuiBase*> stack;
+    for (TreeGroup* g : it->second.groups) stack.push_back(g);
+    while (!stack.empty()) {
+        GuiBase* g = stack.back(); stack.pop_back();
+        if (!g || !seen.insert(g)) continue;
+        auto git = m_byParent.find(g);
+        if (git == m_byParent.end()) continue;
+        git->second.dirty = true;
+        for (TreeGroup* gg : git->second.groups) stack.push_back(gg);
+    }
+}
+
 // ── rawChildren:不带本节点投影的"原始孩子"枚举 ──────
 // ★ 多层分组的关键函数:
-//   · TreeGroup 的原始孩子 = 外层 owner 投影解析出的当前成员
-//     (递归终止于数据侧枚举,不会打转);
+//   · TreeGroup 的原始孩子 = 外层 owner 投影解析出的当前成员(递归终止于数据侧枚举);
 //   · 普通节点 = 数据侧虚接口现场重算(死者天然缺席)。
 // revalidate 内部只准用它取活列表:若走公共 childCount,
 // "对组分组"时 内层revalidate → childCount(组) → 又触发内层revalidate → 无限递归。
@@ -178,8 +209,7 @@ std::vector<GuiBase*> TreeProjection::rawChildren(GuiBase* node) {
     return out;
 }
 
-// 组的"新鲜成员表"就地引用:owner 页先 revalidate(缓存命中近零成本),
-// 然后直接返回账本里的向量地址 —— 不拷贝。
+// 组的"新鲜成员表"就地引用:owner 页先 revalidate,然后直接返回账本里的向量地址 —— 不拷贝。
 // ⚠ 指针有效期到 owner 页下次重算为止;所有调用点都是"取得即用"。
 // 无 owner / owner 无页 / 组不在成员表(已被淘汰)→ nullptr(等价旧行为:空表)。
 const std::vector<GuiBase*>* TreeProjection::freshMembers(TreeGroup* g) {
@@ -188,75 +218,71 @@ const std::vector<GuiBase*>* TreeProjection::freshMembers(TreeGroup* g) {
     auto pit = m_byParent.find(oit->second);
     if (pit == m_byParent.end()) return nullptr;
     revalidate(oit->second, pit->second);          // 先保证外层成员表新鲜
-    // ★ revalidate 可能把 owner 页整页重算(members 被 clear/重建)→ 必须回查迭代器。
-    //   (曾经在这里加过"跨操作复用成员表指针"的缓存并配 stamp 校验,但它引入了
-    //    一个难以复现的陈旧读:T16 事前坐标协议在 Debug 下稳定失败、Release 下通过。
-    //    根因是缓存持有的 vector* 与被 clear 掉的 map 节点生命周期无法可靠绑定。
-    //    该缓存不是消除 O(k²) 的关键(关键是 parentOf/rowOf 的每页一次校验),
-    //    故按"正确性优先"整段移除。)
+    // ★ revalidate 可能整页重算(members 被 move 重建)→ 必须回查迭代器,不得复用旧的。
     pit = m_byParent.find(oit->second);
     if (pit == m_byParent.end()) return nullptr;
     auto mit = pit->second.members.find(g);
     return mit == pit->second.members.end() ? nullptr : &mit->second;
 }
 
-// 缓存钥匙【就地比对】(普通节点版):逐位比虚接口枚举与 lastLive,零分配。
-// childCount 是模型 rowCount 的热路径,常态是"数据没变"—— 命中时
-// 从"分配+拷贝+比较"降为纯比较(宽父亲 200k 孩子实测差一个数量级)。
-// ★ 组页不走这里(见 revalidate 第 0 步):组的枚举会触发 owner 重算,
-//   owner 可能当场淘汰这个组并拆掉本页 → p 悬空,必须先确认页还活着。
-bool TreeProjection::liveMatchesLast(GuiBase* node, Projection& p) {
-    if (!p.valid) return false;                     // 没算过 → 必然走全流水线
-    size_t n = node->visibleChildrenCount();
-    if (n != p.lastLive.size()) return false;
-    for (size_t i = 0; i < n; ++i)
-        if (node->visibleChild(i) != p.lastLive[i]) return false;
-    return true;
+// ── 自愈:枚举原始孩子与 lastLive 比对,漂移 = 调用方漏了通知 ──
+// 使用点:① prune 的 DFS(卫生边界,Release 也跑,verbose=paranoid);
+//         ② childCount 的 paranoid 检测(默认 Debug,verbose=true 当场点名)。
+// 发现漂移:置脏(本次/下次 revalidate 收敛)+ 可选 stderr 报告。绝不 delete 任何东西。
+bool TreeProjection::healIfDrift(GuiBase* node, Projection& p, bool verbose) {
+    if (!p.valid) return false;                    // 没算过的页无所谓陈旧
+    if (p.dirty) return false;                     // ★已被通知的脏页:漂移是【预期内】的,
+                                                   //   马上会被 revalidate 重算,不是漏报
+                                                   //   (没有这行,notifyRemove→读 的正常流程会被误点名)
+    const std::vector<GuiBase*>* mem = nullptr;
+    std::vector<GuiBase*> rawBuf;
+    if (auto* g = dynamic_cast<TreeGroup*>(node)) {
+        mem = freshMembers(g);                     // 触发 owner 重算 —— 可能连锁把本组淘汰!
+        if (m_byParent.find(node) == m_byParent.end()) return false;   // 本页已被拆:无需自愈
+    } else {
+        size_t n = node->visibleChildrenCount();
+        rawBuf.reserve(n);
+        for (size_t i = 0; i < n; ++i) rawBuf.push_back(node->visibleChild(i));
+        mem = &rawBuf;
+    }
+    size_t n = mem ? mem->size() : 0;
+    bool drift = (n != p.lastLive.size());
+    if (!drift)
+        for (size_t i = 0; i < n; ++i)
+            if ((*mem)[i] != p.lastLive[i]) { drift = true; break; }
+    if (drift) {
+        p.dirty = true;
+        if (verbose)
+            fprintf(stderr,
+                    "[TreeProjection] 漏报检测:owner=%p 的数据已变化但未收到 invalidate —— 已自愈。\n"
+                    "  请在这个父亲的数据变更后调用 invalidate(parent)(删除用 notifyRemove)。\n",
+                    (void*)node);
+    }
+    return drift;
 }
 
 // ── revalidate:引擎心脏 = 流水线的【编排器】────────────
-// live → [过滤] → [分组] → [排序] → flat
+// v4 缓存检查只有一行:干净页零枚举直接返回;脏页重算一次。
 // 各阶段是 pipeline.h 里的纯函数(可独立单测,见 tests.cpp T1~T6);
-// 这里只剩三件带所有权/引擎状态的事:建组、淘汰组(级联拆内层)、写账本。
+// 这里只剩带所有权/引擎状态的事:建组、淘汰组(延迟回收)、写账本、传播置脏。
 void TreeProjection::revalidate(GuiBase* parent, Projection& p) {
-    // 0-0. 查询纪元闸门:本页已在本纪元内校验过 → 无需再枚举活列表。
-    //   (语义完全等价于"活列表与 lastLive 一致",因为纪元保证本次操作内无变更。
-    //    实测 parentOf+rowOf 一次查询原本重复校验同一页 2~3 次。)
-    // ★ m_epochOptimOn:契约 C5 的逃生阀。关掉后这个短路彻底失效 → 每次操作
-    //   都重新枚举活列表,**行为完全不变,只是慢一点**。跨线程/异步改数据树
-    //   的调用方应调 setEpochOptimization(false) —— 见那行 API 注释。
-    if (m_epochOptimOn && p.checkedAt == m_queryEpoch && p.valid) return;
-    // 0. 缓存校验:先【就地比对】活列表与 lastLive(零分配),没变 → 整条流水线跳过;
-    //    变了才真正建快照(swap 进账本,免去一次大向量拷贝 —— 宽父亲 200k 指针)。
-    //    ★ 组页特殊:成员表要靠 owner 重算解析,owner 可能恰好把这组淘汰
-    //      (成员全灭)并顺手拆掉本页 —— p 当场悬空。所以组页先取表、
-    //      再确认本页还在账上,然后才允许碰 p。
-    // ★ checkedAt 在"校验结论得出"的当刻就盖 —— 无论结论是命中还是走完整流水线,
-    //   本纪元内本页都已新鲜。必须在此处盖而不是函数末尾:组页的前置 owner 重算
-    //   可能连锁拆掉本页(见下一行),那种情况下 p 已悬空,末尾写就是 UAF。
+    // 0. 缓存检查的全部(v3 的纪元闸门/就地比对/双路径全部退役):
+    if (p.valid && !p.dirty) return;
+
+    // 组页前置:本页活列表 = owner 成员表,要靠 owner 重算解析;owner 可能恰好
+    // 把这组淘汰(成员全灭)并顺手拆掉本页 —— p 当场悬空。先取表、确认本页还在账上。
     if (auto* selfG = dynamic_cast<TreeGroup*>(parent)) {
-        const std::vector<GuiBase*>* mem = freshMembers(selfG);   // 触发 owner 重算
-        if (m_byParent.find(parent) == m_byParent.end()) return;  // 本页已被拆:放弃
-        if (p.valid) {
-            size_t n = mem ? mem->size() : 0;
-            if (n == p.lastLive.size()) {
-                bool same = true;
-                for (size_t i = 0; i < n; ++i)
-                    if ((*mem)[i] != p.lastLive[i]) { same = false; break; }
-                if (same) { p.checkedAt = m_queryEpoch; return; }  // 命中:整条流水线跳过
-            }
-        }
-    } else if (liveMatchesLast(parent, p)) {
-        p.checkedAt = m_queryEpoch; return;
+        (void)freshMembers(selfG);                          // 触发 owner 重算
+        if (m_byParent.find(parent) == m_byParent.end()) return;   // 本页已被拆:放弃
     }
+
+    p.valid = false;   // ★ 重算开始即撤销"可呈现"承诺:流水线中用户回调(filter/grouping/less)
+                       //   若抛异常,本页停在 valid=false + dirty=true → 下次查询整条重跑收敛,
+                       //   绝不会短路返回含野指针的旧 flat(异常安全闸门,契约 §1.5)。
+
+    // 1. 拉活快照(swap 进账本,免一次大向量拷贝);lastLive 从此兼职"自愈参照"
     std::vector<GuiBase*> live = rawChildren(parent);
     p.lastLive.swap(live);
-    // ★ 这里【不】置 valid / checkedAt —— 见函数末尾的"宣布有效"。
-    //   下面整条流水线要跑用户提供的 filter / grouping / less,任何一个抛异常,
-    //   若此处已宣布有效,下次 childCount 就会因纪元/valid 短路而直接返回
-    //   【上一次】的 flat —— 那份 flat 里可能有已被 delete 的对象的野指针。
-    //   valid 是"本页 flat 可对外呈现"的承诺,只有流水线跑完才配得上。
-    p.checkedAt = m_queryEpoch;
 
     // Stage A:过滤(被滤节点移出投影,rowOf=-1;"搜索定位掀开过滤器"是上层职责)
     std::vector<GuiBase*> vis = Pipeline::filterLive(p.lastLive, p.spec.filter);
@@ -271,22 +297,15 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& p) {
 
     // 参与名单 parts = vis + 【旧组】(每个旧组插在其"首个 vis 可见后代"的原槽位)——
     // 多层分组的关键:旧组可以作为整体被新规则"再分进"一个外层组。
-    // ★ 槽位必须【传递式】下钻:直接成员全是组的组(组→组→数据),直接成员不在
-    //   vis 里,只看一层会拿不到槽位 → 组从 parts 失踪 → 外层规则看不见它
-    //   (用户最简复现:手动组3 只挂上了标准件,手动组2 没被收进去)。
-    // 成员已全灭的旧组不进 parts(交给淘汰逻辑清掉)。
+    // ★ 槽位必须【传递式】下钻:直接成员全是组的组,只看一层会拿不到槽位
+    //   → 组从 parts 失踪 → 外层规则看不见它(用户最简复现钉死为 interactive P 步)。
     std::vector<GuiBase*> parts;
     if (oldAll.empty()) {
-        // 没有旧组(冷启动最常见):参与名单就是可见名单,swap 免一次大拷贝
-        parts.swap(vis);
+        parts.swap(vis);          // 冷启动最常见:参与名单就是可见名单
     } else {
-        // ⚠ 变量名绝不能叫 slots/signals/emit —— 它们是 Qt 关键字宏(QObject 头),
-        //   会被预处理器替换成 Q_SLOTS 等,声明静默变垃圾、报错报在使用处。
-        // vis 槽位查找,两档自适应:
-        //   窄亲(≤256 孩子)→ 线性扫:连续内存指针比较,比一次哈希查找还快
-        //     (实测 100 孩子×10 组:哈希建表+查找反而比基线慢 ~2 倍/页);
-        //   宽亲(>256)→ 哈希索引:线性会退化成 O(组×成员×孩子),
-        //     bench 宽亲场景(数万孩子×数百组)线性要数秒、哈希毫秒级。
+        // ⚠ 变量名绝不能叫 slots/signals/emit —— Qt 关键字宏会静默吃掉声明。
+        // vis 槽位查找两档自适应:窄亲(≤256)线性扫(连续内存比哈希快);
+        // 宽亲(>256)哈希索引(线性会退化成 O(组×成员×孩子))。
         const bool useSlotMap = vis.size() > 256;
         std::unordered_map<GuiBase*, size_t> visSlot;
         if (useSlotMap) {
@@ -296,9 +315,9 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& p) {
         std::function<size_t(GuiBase*, std::set<GuiBase*>&)> firstVis;
         firstVis = [&](GuiBase* x, std::set<GuiBase*>& guard) -> size_t {
             if (!guard.insert(x).second) return SIZE_MAX;      // 防脏数据成环
-            if (useSlotMap) {                                  // 数据节点:自己的槽位
+            if (useSlotMap) {
                 auto sit = visSlot.find(x);
-                if (sit != visSlot.end()) return sit->second;
+                if (sit != visSlot.end()) return sit->second;  // 数据节点:自己的槽位
             } else {
                 for (size_t i = 0; i < vis.size(); ++i)
                     if (vis[i] == x) return i;
@@ -343,39 +362,32 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& p) {
 
     // Stage B-3:复用匹配(纯函数),然后引擎做所有权动作:
     // 复用旧组(指针稳定 → QModelIndex/展开/选中状态跨重算存活)或新建;
-    // 未复用的旧组淘汰(★级联拆其内层投影,否则子组泄漏+僵尸 key)
+    // 未复用的旧组淘汰(★级联拆其内层投影 + 延迟回收,读侧触发绝不 delete —— 契约 C1)
     std::vector<TreeGroup*> culled;
-    // ★ 复用/淘汰的旧组名单 = oldAll(全层),不是 p.groups(只顶层):
-    //   嵌套组(作为成员的组)若不在名单里就无法被复用 → 重算即孤悬泄漏
     auto reuse = Pipeline::matchReusable(buckets, oldAll, culled);
     std::map<TreeGroup*, std::vector<GuiBase*>> newMembers;
     for (size_t i = 0; i < buckets.size(); ++i) {
-        TreeGroup* g = reuse[i] ? reuse[i] : [&]{ 
-            TreeGroup* ng = new TreeGroup(buckets[i].ticket, parent);
-            hintMark(m_groupHint, ng);        // ★ 组创建的唯一置位点(见 m_pageHint 注释)
-            return ng; }();
+        TreeGroup* g = reuse[i] ? reuse[i] : new TreeGroup(buckets[i].ticket, parent);
         g->updateTicket(buckets[i].ticket);   // label/order 以新 Spec 为准
         newMembers[g] = buckets[i].members;
         m_groupOwner[g] = parent;
     }
     // ★ 沦为"成员"的旧组不能淘汰 —— 它活在外层组里面(多层分组的存活路径)。
-    //   仅在有淘汰候选时才全扫成员(dynamic_cast 不便宜:百万成员的全量重算
-    //   里这一遍就是几十 ms;稳态 culled 为空 → 整遍跳过)
+    //   仅在有淘汰候选时才全扫成员(dynamic_cast 不便宜,稳态 culled 为空 → 整遍跳过)
     std::set<TreeGroup*> asMember;
     if (!culled.empty())
         for (const auto& kv : newMembers)
             for (GuiBase* m : kv.second)
                 if (auto* mg = dynamic_cast<TreeGroup*>(m)) asMember.insert(mg);
-    std::set<GuiBase*> deleted;                 // 本轮真删掉的旧组(落位时必须排除)
+    std::set<GuiBase*> deleted;                 // 本轮真淘汰的旧组(落位时必须排除)
     for (TreeGroup* g : culled) {
         if (asMember.count(g)) continue;
         m_groupOwner.erase(g);
-        // ★ deferDelete=true:revalidate 由【读侧】(childCount==rowCount)也能触发,
-        //   这里绝不能 delete —— 见 m_retired 的 UAF 说明。
-        dropProjection(g, /*deferDelete=*/true);   // 只拆 g 自己名下的内层投影页
-        // ★ g 本身必须【单独】入队:dropProjection 遍历的是"parent 的 p.groups",
-        //   而 g 在本页的 members 表里(不在 p.groups),所以上面那次调用根本
-        //   不会碰 g 自己。少了这一行 = 组既没被回收、也没被记账(实测踩过)。
+        // deferDelete=true:revalidate 由【读侧】(childCount==rowCount)也能触发,
+        // 这里绝不能 delete —— 组进 m_retired 等 collectGarbage(契约 C1/C3)。
+        dropProjection(g, /*deferDelete=*/true);   // 拆 g 名下的内层投影页
+        // ★ g 本身必须单独入队:dropProjection 遍历的是"g 的 p.groups",
+        //   g 自己不在其中(它在【本页】的账上)—— 少了这行 = 组既没回收也没记账。
         noteRetired(g);
         deleted.insert(g);
     }
@@ -383,34 +395,35 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& p) {
     // Stage B-4:组内成员排序(与全局同一比较器)
     Pipeline::sortMembers(newMembers, p.spec.less);
 
-    // 重建本 parent 的成员账本(反查只在各层投影内部,parentOf 逐层下钻)
-p.members = std::move(newMembers);
-    p.memberToGroup.clear();
-    {   // ★ 预留到精确规模:memberToGroup 是全引擎最 memberToGroup 最大的表
-    //   (百万节点场景 = 100 万条成员映射),让它自然增长会经历一串 rehash
-    //   —— 每次 rehash 都是"重建整张桶数组 + 全量重插",既是时间浪费,
-    //   也会把峰值内存顶上去(实测 bench 峰值 WS 差 60 MB 就是这么来的)。
-    size_t total = 0;
-    for (const auto& kv : p.members) total += kv.second.size();
-    p.memberToGroup.reserve(total);
+    // 重建本页成员账本
+    p.members = std::move(newMembers);
+
+    // ★ entries 阶段①:成员行(container=所属组,row=组内序号)。
+    //   buildFlat 的 rep 上溯依赖这张表,必须先于落位建好。
+    p.entries.clear();
+    {
+        size_t total = 0;
+        for (const auto& kv : p.members) total += kv.second.size();
+        p.entries.reserve(total + p.lastLive.size());   // 连同 flat 行一次留够,免 rehash
     }
     for (const auto& kv : p.members)
-        for (GuiBase* m : kv.second) p.memberToGroup[m] = kv.first;
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            PosEntry e{ kv.first, (int)i };             // MSVC 嵌套花括号稳妥写法
+            p.entries[kv.second[i]] = e;
+        }
 
     // 落位 + Stage C:组落在首成员原位置,然后整体 stable_sort
-    // (落位遍历 parts 而非 vis:未进桶的旧组也要作为直属组留在本层;
-    //  ★ 但本轮已 delete 的旧组必须剔除 —— 它的成员还活着所以仍在 parts 里,
+    // (落位遍历 parts:未进桶的旧组也要作为直属组留在本层;
+    //  ★ 本轮已淘汰的旧组必须剔除 —— 它的成员还活着所以仍在 parts 里,
     //    不排除就是把野指针推进 flat,S2 的 use-after-free 就这么来的)
     std::vector<GuiBase*> flatParts;
     flatParts.reserve(parts.size());
     for (GuiBase* x : parts)
         if (!deleted.count(x)) flatParts.push_back(x);
-    // 记住旧形状,末尾与新形状比对(结构版本号用)
     const size_t oldFlatSize = p.flat.size();
     const size_t oldGroupCount = p.groups.size();
-    p.flat = Pipeline::buildFlat(flatParts, p.memberToGroup);
+    p.flat = Pipeline::buildFlat(flatParts, p.entries, parent);
     Pipeline::sortFlat(p.flat, p.spec.less);
-    const size_t newFlatSize = p.flat.size();
 
     // 组账本 = 本层顶层组(flat 里的组)∪ 成员表全部组键(含"作为成员"的嵌套组)。
     // 只记顶层会漏掉嵌套组 → 下轮 matchReusable 认不出它们 → 重算即孤悬。
@@ -424,101 +437,51 @@ p.members = std::move(newMembers);
             if (seenG.insert(kv.first).second) all.push_back(kv.first);
         p.groups = all;
     }
-    const size_t newGroupCount = p.groups.size();
 
-    // ★ 位置索引:节点 → (投影父亲, 行号)。建在【宣布有效之前】,失败则整页留在
-    //   valid=false,与 flat 的异常安全语义一致(见下面"宣布有效"的注释)。
-    //   两个来源:flat 里的每项(父亲=本页 owner)+ 每组的成员(父亲=该组)。
-    p.memberToPos.clear();
-    {
-        size_t total = p.flat.size();
-        for (const auto& kv : p.members) total += kv.second.size();
-        p.memberToPos.reserve(total * 2);            // 负载 0.5,避免 rehash
+    // ★ entries 阶段②:flat 行(container=owner,row=flat 序号)。
+    //   与阶段①键集零交集:成员不进 flat,flat 里的组/直属不是本页任何组的成员。
+    for (size_t i = 0; i < p.flat.size(); ++i) {
+        PosEntry e{ parent, (int)i };
+        p.entries[p.flat[i]] = e;
     }
-    for (size_t i = 0, c = p.flat.size(); i < c; ++i)
-        p.memberToPos[p.flat[i]] = { parent, static_cast<int>(i) };
-    for (const auto& kv : p.members)
-        for (size_t i = 0, c = kv.second.size(); i < c; ++i)
-            p.memberToPos[kv.second[i]] = { kv.first, static_cast<int>(i) };
-    // 同一份数据登记"这个节点属于哪一页"(供 parentOf/rowOf 的 O(1) 快路径)。
-    // ★ 登记集合 = flat ∪ 各组名下的成员 —— 与 memberToPos 的键集【完全一致】,
-    //   因为 memberToGroup 只在遍历 p.members 时填,而 flat 里的组都来自 p.groups。
-    for (const auto& kv : p.memberToPos) m_nodePage[kv.first] = parent;
 
-    // ★ 流水线全部跑完,现在才宣布本页有效(异常安全闸门)。
-    //   上面任何一步抛异常(用户 filter/grouping/less 都可能抛),本页都会停在
-    //   valid=false → 下次查询重跑整条流水线 → 状态自动收敛到正确值。
-    //   在此之前绝不能置 valid:那会让下次 childCount 短路返回【旧 flat】,
-    //   而旧 flat 里可能含已被 delete 的对象的野指针。
+    // ★ 保守传播:本页名下凡有自己账页的组一律置脏(成员表可能变了)。
+    //   深度=组嵌套层数、成本=O(组数) 的置位;过收敛的代价只是组页多一次重算 ——
+    //   用"绝不精确 diff"换"绝不漏传播"(invalidate 侧还有一份传递置脏,双保险)。
+    for (TreeGroup* g : p.groups) {
+        auto git = m_byParent.find(g);
+        if (git != m_byParent.end()) git->second.dirty = true;
+    }
+
+    // ★ 流水线全部跑完,现在才宣布有效(异常安全闸门,见 p.valid 注释)
     p.valid = true;
-    p.checkedAt = m_queryEpoch;
-    // ★ 结构版本号:只有"形状真的变了"才递增 —— 组增删 或 行数变化。
-    //   内容变化(同形状下的成员替换)不递增,因为它不破坏模型坐标。
-    //   这是给调用方的失步自检工具(见 m_structRev 注释)。
-    if (!deleted.empty() || newFlatSize != oldFlatSize || newGroupCount != oldGroupCount)
+    p.dirty = false;
+    // 结构版本号:只有"形状真的变了"才递增(组增删 或 行数变化)。
+    // 内容变化(同形状下的成员替换)不递增,因为它不破坏模型坐标。
+    if (!deleted.empty() || p.flat.size() != oldFlatSize || p.groups.size() != oldGroupCount)
         ++m_structRev;
 }
 
-// ── 纪元优化的逃生阀 + 跨线程检测(契约 C5)─────────────
-void TreeProjection::setEpochOptimization(bool enabled) {
-    if (enabled == m_epochOptimOn) return;
-    m_epochOptimOn = enabled;
-    // 关闭时必须把所有页的 checkedAt 清零:否则残留的旧纪元值可能在
-    // "某次操作恰好复用了同一个 epoch 数字"时命中(epoch 是单调递增,
-    // 理论上不会,但清零让"关掉就一定全量枚举"成为可推理的不变量)。
-    if (!enabled)
-        for (auto& kv : m_byParent) kv.second.checkedAt = 0;
-    m_queryEpoch = 0;          // 让下一次操作从新纪元开始
-}
-
-void TreeProjection::onOutermostEntry() {
-    ++m_crossThreadEntries;
-#ifdef _DEBUG
-    std::thread::id self = std::this_thread::get_id();
-    if (!m_threadKnown) { m_entryThread = self; m_threadKnown = true; }
-    else if (self != m_entryThread) {
-        // 只报一次,免得刷屏;不崩 —— 纪元优化在跨线程下本来就"只是变慢/变陈旧"
-        fprintf(stderr,
-                "[TreeProjection] ⚠ 检测到跨线程进入引擎(契约 C5 前提不成立)。\n"
-                "  数据树若被后台线程改动,请调用 setEpochOptimization(false) 退回全枚举。\n"
-                "  跨线程进入次数=%zu\n", m_crossThreadEntries);
-    }
-#endif
-}
+// ── uninstall:级联删组清账,恢复透传 ──────────────────
 // deferDelete:false = 立即 delete(写侧边界,调用方已保证视图坐标失效);
-//              true  = 只摘账、组进 m_retired 等 collectGarbage(读侧路径专用)。
-//   读侧绝不能 delete:QTreeView 对每个展开的组持有 QPersistentModelIndex,
-//   其 internalPointer 就是这个 TreeGroup*,释放即 UAF 且不发任何信号。
+//              true  = 只摘账、组进 m_retired 等 collectGarbage(读侧路径专用,契约 C1)。
 void TreeProjection::dropProjection(GuiBase* parent, bool deferDelete) {
     auto it = m_byParent.find(parent);
     if (it == m_byParent.end()) return;
     Projection& p = it->second;
-    // ★ 位置索引必须与本页同生共死:先把"可能指向本页的键"收齐再删。
-    //   点查删除而不按值扫全表,是为了避免 O(节点总数) 的拆页成本。
-    // ★ 键集直接取 memberToPos 的键(评审修复 R2,2026-10-06):
-    //   登记循环就是 `for (kv : memberToPos) m_nodePage[kv.first] = parent`,
-    //   清理与登记【对称同源】,不可能漂移。旧实现收的是 flat + members 的
-    //   【组键】(kv.first),漏掉了各组成员(kv.second)—— 探针实证(probe P2):
-    //   6 条只清掉 2 条,4 条组成员条目永久残留(靠快路径查不到时回退兜底,
-    //   答案仍正确,但 m_nodePage 随组变更单调积累 = 内存泄漏)。
-    {
-        for (const auto& kv : p.memberToPos) {
-            auto nit = m_nodePage.find(kv.first);
-            if (nit != m_nodePage.end() && nit->second == parent) m_nodePage.erase(nit);
-        }
-    }
+    // ★ v4:位置索引(entries)是页内成员,随 m_byParent.erase 一起析构 ——
+    //   没有全局副本要清,v3 R2 那类"登记/清理不对称"泄漏在结构上不可能发生。
     for (TreeGroup* g : p.groups) {
         m_groupOwner.erase(g);
-        dropProjection(g, deferDelete);                 // ★级联:组名下的内层投影先拆
+        dropProjection(g, deferDelete);                 // ★级联:组名下的内层投影页先拆
         if (deferDelete) noteRetired(g); else delete g;
     }
     m_byParent.erase(it);   // 哈希表:递归只 erase 别的 key,本迭代器仍有效
 }
 
-// 真正释放已淘汰的组 —— 全工程唯一 delete TreeGroup 的地方(除引擎析构)。
-// ★ 调用时机契约:必须在视图的 persistent index 全部失效之后,即
-//   beginResetModel / endResetModel 之内。NavTreeModel 的 beginFullReset
-//   已经自动调用它(见 navtreemodel.h),所以走 reset 通道的调用方零心智负担。
+// 真正释放已淘汰的组 —— 全工程唯一 delete TreeGroup 的地方(除引擎析构与写侧立即释放)。
+// ★ 调用时机契约:视图的 persistent index 全部失效之后,即 begin/endResetModel 或
+//   begin/endRemoveRows 之内。NavTreeModel 的 endFullReset/endRowRemoval 已自动调用。
 void TreeProjection::collectGarbage() {
     for (TreeGroup* g : m_retired) delete g;
     m_retired.clear();
@@ -546,38 +509,29 @@ void TreeProjection::unregisterRoot(GuiBase* root) {
 }
 
 // prune 的 DFS:只沿活枚举下行,死者走不到也绝不 deref。
-// ★ 显式栈迭代版(原递归版在 bench deep 场景 10 万级深链上爆栈崩溃;
-//   百万节点导航树里"深度不受限"必须是引擎自身保证,不能赌调用方栈大小)。
-// ★ 孩子枚举就地走虚接口/成员表引用,不再经 rawChildren 拷整张向量
-//   (1M 节点 DFS = 1M 次向量分配,实测占 prune 大头)。
+// ★ 显式栈迭代(递归版在 10 万级深链上实测爆栈);孩子枚举就地走虚接口/成员表引用。
+// ★ v4 新增职责:每到一个账页先 healIfDrift —— prune 是卫生边界,
+//   漏通知的陈旧页在这里全部收敛(Release 也跑,这是"忘了通知最多陈旧到下一次 prune"的兑现点)。
 void TreeProjection::collectReachable(GuiBase* root, PtrSet& seen) {
-    std::vector<GuiBase*> stack;         // 显式 DFS 栈(深度不限,内存在堆上)
+    std::vector<GuiBase*> stack;
     stack.push_back(root);
     while (!stack.empty()) {
         GuiBase* n = stack.back();
         stack.pop_back();
         if (!n || !seen.insert(n)) continue;   // 兼防脏数据成环
-        // ★ 提示位图门控:两个提示都没置位 ⇒ 一定无账页且不是组 ⇒ 直接走原始枚举。
-        //   省掉的是每个普通节点一次的哈希探测(cache miss)+ dynamic_cast(RTTI 走链),
-        //   实测合计 60~80 ns/节点。提示位永不漏置(创建点只有 projection() 与
-        //   new TreeGroup 两处),只会多算不会漏算 —— 漏算才是致命的,多算无害。
-        if (!hintProbe(m_pageHint, n) && !hintProbe(m_groupHint, n)) {
-            size_t cnt = n->visibleChildrenCount();
-            for (size_t i = 0; i < cnt; ++i) stack.push_back(n->visibleChild(i));
-            continue;
-        }
         auto pit = m_byParent.find(n);
         if (pit != m_byParent.end()) {
-            revalidate(n, pit->second);               // 保证 flat 新鲜再走账本
-            pit = m_byParent.find(n);                 // 组页可能被连锁拆页 → 回查
+            healIfDrift(n, pit->second, /*verbose=*/m_paranoid);   // 漏通知自愈
+            pit = m_byParent.find(n);            // heal 的 freshMembers 可能连锁拆组页 → 回查
+            if (pit == m_byParent.end()) continue;
+            revalidate(n, pit->second);          // 保证 flat 新鲜再走账本
+            pit = m_byParent.find(n);            // 组页可能被连锁拆页 → 回查
             if (pit == m_byParent.end()) continue;
             for (GuiBase* c : pit->second.flat) stack.push_back(c);
         } else if (auto* g = dynamic_cast<TreeGroup*>(n)) {
-            // 组:成员表就地引用(freshMembers 内部已 revalidate owner)
             if (const auto* mem = freshMembers(g))
                 for (GuiBase* c : *mem) stack.push_back(c);
         } else {
-            // 普通节点:就地走虚接口,不拷向量
             size_t cnt = n->visibleChildrenCount();
             for (size_t i = 0; i < cnt; ++i) stack.push_back(n->visibleChild(i));
         }
@@ -586,17 +540,10 @@ void TreeProjection::collectReachable(GuiBase* root, PtrSet& seen) {
 
 // 腿②:可达性剪枝。走不到的 key = 死者 → 清条目 + 删孤儿组
 void TreeProjection::prune() {
-    EpochScope epoch(this);   // 同 install:prune 是操作边界,必须重开纪元
     if (m_roots.empty()) return;
-    // ★ 账本空 = 没有任何可被剪枝的对象 → 整个 DFS 是纯白走。
-    //   冷启动首装(bindSpec 第一次生效)正是这个状态:bench 实测省掉
-    //   一次 1M 节点全树 DFS(约 250 ms)。判据:m_byParent 空 ⟹ m_groupOwner 也必空
-    //   (每个组都由某个账页创建,dropProjection 双向成对维护),故无孤儿组可释放。
+    // 账本空 = 没有任何可被剪枝的对象 → 整个 DFS 是纯白走(冷启动首装省一次全树 DFS)
     if (m_byParent.empty() && m_groupOwner.empty()) return;
-    // 去重集:只做指针值哈希,永不 deref(生存法则不变)。★ 用 PtrSet(开放寻址)
-    //   而非 unordered_set:后者在 1M 节点上实测 234 ns/节点,占 prune 总耗时 2/3,
-    //   而"走树"本身只要 8.7 ns/节点(见 ptrset.h 头注释的 A/B 数据)。
-    PtrSet seen;
+    PtrSet seen;   // 只做指针值哈希,永不 deref(生存法则不变)
     for (GuiBase* r : m_roots) collectReachable(r, seen);
     std::vector<GuiBase*> stale;
     for (auto& kv : m_byParent)
@@ -609,7 +556,6 @@ void TreeProjection::prune() {
 
 void TreeProjection::bindSpec(SpecBinding b) {
     if (!b.locate) return;
-    EpochScope epoch(this);   // 写侧操作边界
     unbindSpec(b.id);                       // 同 id 覆盖(幂等;内含 ++m_bindGen)
     m_bindings.push_back(std::move(b));
     ++m_bindGen;                            // 绑定表变了 → 所有"同绑定豁免"作废
@@ -624,17 +570,13 @@ void TreeProjection::unbindSpec(const std::string& id) {
 }
 
 // walkBindings 的安装入口:同绑定豁免。
-// 页的 (bindId, bindGen) 与当前绑定一致 → Spec 必然一字未动 →
-// 只做 revalidate(数据没变即缓存命中,近零成本);否则走完整 installInternal。
-// ★ 没有这条豁免时,rebind 里 walkBindings 会把 prune 刚重算完的每一页
-//   再强制 valid=false 全量重算一遍(bench 实测 1 万页多花 ~550ms)。
+// 页的 (bindId,bindGen) 与当前绑定一致 → Spec 必然一字未动 → 什么都不做
+// (页脏不脏由通知/prune 自愈决定,这里不再强制重算 —— v3 的 walk 因此从 1.1s 降到 0.5s)。
 void TreeProjection::installFromBinding(GuiBase* n, const SpecBinding& b) {
     auto pit = m_byParent.find(n);
     if (pit != m_byParent.end() && pit->second.bindGen == m_bindGen
-        && pit->second.bindId == b.id) {
-        revalidate(n, pit->second);         // 同绑定:数据驱动重算(命中≈零成本)
-        return;
-    }
+        && pit->second.bindId == b.id)
+        return;                             // 同绑定:页已在,数据变更走通知/自愈通道
     installInternal(n, b.spec, {});
     pit = m_byParent.find(n);               // 盖上出身章(下次 rebind 豁免用)
     if (pit != m_byParent.end()) {
@@ -643,7 +585,7 @@ void TreeProjection::installFromBinding(GuiBase* n, const SpecBinding& b) {
     }
 }
 
-// rebind 的 DFS:同样显式栈迭代(深链不设限),语义与旧递归版逐节点一致
+// rebind 的 DFS:显式栈迭代,语义与旧递归版逐节点一致
 void TreeProjection::walkBindings(GuiBase* root, PtrSet& seen) {
     std::vector<GuiBase*> stack;
     stack.push_back(root);
@@ -651,35 +593,20 @@ void TreeProjection::walkBindings(GuiBase* root, PtrSet& seen) {
         GuiBase* n = stack.back();
         stack.pop_back();
         if (!n || !seen.insert(n)) continue;
-        // 提示位图只用来【跳过昂贵的"否定探测"】,绝不能跳过谓词 ——
-        //   locate 必须对每个活数据节点求值,否则"谓词命中但没账页"的节点
-        //   永远装不上投影(声明式绑定的全部意义就没了)。
-        //   门控后能免掉的:① 无组提示 ⇒ 跳过 dynamic_cast(确定不是组);
-        //     ② 无页提示 ⇒ 跳过 m_byParent 的哈希探测(确定没账页)。
-        //   (漏置位只会多算不会漏算,失效方向安全 —— 见 m_pageHint 注释)
-        const bool maybeGroup = hintProbe(m_groupHint, n);
-        // ★ 绑定谓词【不对组节点求值】:组是投影产物不是数据节点。否则当组 label
-        //   与 locate 特征同名时,会对组再装投影 → 组内成员又被同规则分出内层组 →
-        //   内层组 label 仍同名 → 无限嵌套(实测栈/堆耗尽崩在 operator new)。
-        // ★ 先判"不是组"再求值 locate(评审修复 R3,2026-10-06):
-        //   旧写法 `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` 会对组节点
-        //   求值 locate(只是不安装)—— 违反不变量#3 的字面承诺"绑定谓词不对
-        //   组节点求值"(探针实证 4 次)。用户的 locate 若对组做无防御的
-        //   static_cast/成员访问就是未定义行为。求值顺序换回来,
-        //   位图门控的收益保留(无组提示 ⇒ 免 dynamic_cast 直接放行到 locate)。
-        const bool notGroup = maybeGroup ? !isGroup(n) : true;
-        if (notGroup)
+        // ★ 绑定谓词【不对组节点求值】(不变量#3):先判非组再跑 locate ——
+        //   组 label 与 locate 特征同名时会对组装投影 → 无限嵌套(实测崩在 operator new);
+        //   且用户 locate 对组做无防御 cast 即 UB(评审 R3:求值顺序也是契约)。
+        if (!isGroup(n))
             for (auto& b : m_bindings)
                 if (b.locate(n))
-                    installFromBinding(n, b);   // 同绑定豁免:表没变 → 只校验缓存,不强制重算
-        auto pit = m_byParent.end();
-        if (hintProbe(m_pageHint, n)) pit = m_byParent.find(n);
+                    installFromBinding(n, b);
+        auto pit = m_byParent.find(n);
         if (pit != m_byParent.end()) {
             revalidate(n, pit->second);
             pit = m_byParent.find(n);                 // 组页可能被连锁拆页 → 回查
             if (pit == m_byParent.end()) continue;
             for (GuiBase* c : pit->second.flat) stack.push_back(c);
-        } else if (auto* g = maybeGroup ? dynamic_cast<TreeGroup*>(n) : nullptr) {
+        } else if (auto* g = dynamic_cast<TreeGroup*>(n)) {
             if (const auto* mem = freshMembers(g))
                 for (GuiBase* c : *mem) stack.push_back(c);
         } else {
@@ -689,46 +616,39 @@ void TreeProjection::walkBindings(GuiBase* root, PtrSet& seen) {
     }
 }
 
-// ★ 全量重建后的标准动作(beginResetModel → wipe → prune → rebuild → rebind → endResetModel)
+// ★ 全量重建后的标准动作(beginFullReset → wipe → prune → rebuild → rebind → endFullReset)
 void TreeProjection::rebind() {
-    EpochScope epoch(this);   // 全量重建的操作边界:内部 DFS 全部共享本纪元
-    prune();
+    prune();   // 内含全量自愈:重建后的地址复用幽灵/漏通知陈旧页全部在这里收敛
     if (m_bindings.empty() || m_roots.empty()) return;
     PtrSet seen;
     for (GuiBase* r : m_roots) walkBindings(r, seen);
 }
 
 void TreeProjection::refresh(GuiBase* parent) {
-    EpochScope epoch(this);
     prune();
     auto it = m_byParent.find(parent);
     if (it == m_byParent.end()) return;
-    it->second.valid = false;
-    it->second.checkedAt = 0;   // 强制下一句 revalidate 真跑一遍(纪元闸门要一起作废)
+    it->second.dirty = true;
     revalidate(parent, it->second);
 }
 
-// ══ 读侧四件套(ITreeSource) ══
+// ══ 读侧四件套(ITreeSource)══
 
 size_t TreeProjection::childCount(GuiBase* node) {
     if (!node) return 0;
-    EpochScope epoch(this);   // 查询纪元:本次操作内每页只校验一次(见 m_queryEpoch)
-    // ★ 装过投影的节点(含"组内分组"的 TreeGroup)→ 优先返回投影序列。
-    //   顺序不能反:组既有外层成员表又可能有内层投影时,内层投影才是它当前的孩子。
     auto it = m_byParent.find(node);
     if (it != m_byParent.end()) {
-        revalidate(node, it->second);          // childCount 是唯一校验点
-        // revalidate 对组页可能连锁触发 owner 重算并把本页整页淘汰(组蒸发),
-        // 迭代器随之失效 → 回查一次,页没了按 0 处理(调用方手里的 node 指针
-        // 此刻也已失效,这是"末成员死亡 → 信号发在组行"协议要防的既有边界)
-        it = m_byParent.find(node);
+        if (m_paranoid) {
+            // 漏报检测(默认 Debug):干净页也枚举比对一次,漂移即点名+自愈
+            healIfDrift(node, it->second, /*verbose=*/true);
+            it = m_byParent.find(node);          // heal 可能连锁拆组页 → 回查
+            if (it == m_byParent.end()) return 0;
+        }
+        revalidate(node, it->second);            // 脏才重算;干净页零枚举
+        it = m_byParent.find(node);              // 组页可能被连锁拆页 → 回查
         return it == m_byParent.end() ? 0 : it->second.flat.size();
     }
-    // 没装页 → 原始枚举。★ 不再经 rawChildren 拷整张向量:
-    //   组 = owner 成员表就地取 size;普通节点 = 虚接口直读。
-    //   (旧实现:rowOf 循环里每次 child(group,i) 都拷一遍成员表 + 顺带
-    //    revalidate 校验 owner 全量活列表 → O(组员×父孩子) 复合二次方,
-    //    bench wide 场景单次 rowOf 0.4s,1 万次要跑一小时)
+    // 没装页 → 原始枚举。组 = owner 成员表就地取 size;普通节点 = 虚接口直读。
     if (auto* g = dynamic_cast<TreeGroup*>(node)) {
         const auto* mem = freshMembers(g);
         return mem ? mem->size() : 0;
@@ -737,14 +657,11 @@ size_t TreeProjection::childCount(GuiBase* node) {
 }
 
 GuiBase* TreeProjection::child(GuiBase* node, size_t i) {
-    // 约定:模型先 childCount(校验缓存)再 child(读缓存)
+    // 约定:模型先 childCount(触发重算)再 child(读缓存)
     if (!node) return nullptr;
-    EpochScope epoch(this);   // 与 childCount 同理:每次操作开新纪元
     auto it = m_byParent.find(node);
-    if (it != m_byParent.end()) {
-        if (i < it->second.flat.size()) return it->second.flat[i];
-        return nullptr;
-    }
+    if (it != m_byParent.end())
+        return i < it->second.flat.size() ? it->second.flat[i] : nullptr;
     if (auto* g = dynamic_cast<TreeGroup*>(node)) {
         const auto* mem = freshMembers(g);     // O(1) 就地取,不拷成员表
         return (mem && i < mem->size()) ? (*mem)[i] : nullptr;
@@ -752,118 +669,58 @@ GuiBase* TreeProjection::child(GuiBase* node, size_t i) {
     return i < node->visibleChildrenCount() ? node->visibleChild(i) : nullptr;
 }
 
-GuiBase* TreeProjection::parentOf(GuiBase* node) {
-    if (!node) return nullptr;
-    // ★ 纪元必须在【快路径之前】开(评审修复 R1,2026-10-06):
-    //   快路径内部的 revalidate 依赖"当前纪元"做闸门。若本函数不开纪元,
-    //   m_queryEpoch 还停在上一次操作 —— 数据侧静默变更后,闸门会把
-    //   "上一操作校验过"误当"本操作校验过" → 返回陈旧坐标。
-    //   探针实证(probe_review P1):删 L1 后裸 rowOf(L3) 答 1(真值 0)。
-    //   开纪元后:每个操作首次触页必重枚举(与旧实现语义一致),
-    //   同操作内后续查询仍吃 O(1) 索引 —— 快慢两层都保住。
-    EpochScope epoch(this);
-    // ★★ 快路径(2026-10-06 落地):位置索引直接查表 —— O(1)。
-    //    账本里 memberToPos 存的 first 就是【已解析好的投影父亲】(被分组就是那个组,
-    //    没进组就是自然父亲),这正是本函数的返回值 —— 不需要再下钻、也不需要校验。
-    //    旧实现每层都要 revalidate(全枚举该页全部孩子)才能查 memberToGroup,
-    //    于是"对每个成员问一次 parentOf" = O(k²);k=5000 时单次 8.6 µs、一次首屏 76 ms。
-    //    与旧实现逐项对拍 0 差异(985 项全树 + 200 轮随机增删/换规则/重装)。
-    //    查不到 = 不在任何投影页上 → 回退旧路径(语义完全不变,只是慢)。
-    {
-        auto pg = m_nodePage.find(node);
-        if (pg != m_nodePage.end()) {
-            auto pit = m_byParent.find(pg->second);
-            if (pit != m_byParent.end()) {
-                // ★ 本页在本操作纪元内没校验过就补一次 —— 这与旧实现的校验语义一致,
-                //   但粒度是【每页最多一次】而不是旧实现的"每问一个成员枚举一遍全页"。
-                //   (为什么不干脆不校验:checkEpoch 会被 beginQuery 之类重置为 0,
-                //    此时索引可能来自更早的纪元 —— 直接采信会返回陈旧答案,
-                //    T16 事前坐标协议就是这么被抓到的。)
-                revalidate(pg->second, pit->second);
-                pit = m_byParent.find(pg->second);      // 页可能被连锁拆掉 → 回查
-                if (pit != m_byParent.end()) {
-                    auto mit = pit->second.memberToPos.find(node);
-                    if (mit != pit->second.memberToPos.end()) return mit->second.first;
-                }
-            }
-        }
-    }
-    // ── 回退路径(保持原语义不变;纪元已在函数开头开过,嵌套不再递增)──
-    // ★ 多层分组:组本身也可能是外层组的成员 —— 所以组不直接返回 owner,
-    //   而是从 owner 出发和普通节点走同一条下钻链(每层查该层 memberToGroup),
-    //   终止于"没装投影"或"这层没把它分组"→ 天然 deepest-wins,无全局反查表
+// ── locate:parentOf/rowOf 共用的下钻定位(v4 单表版)──────
+// 返回 {投影父亲, 行号};行号 -1 = 需要调用方兜底扫描(透传父)或不在投影树(被过滤)。
+// 下钻规则(与 v3 parentOf 逐项等价,但查 entries 单表、干净页零枚举):
+//   自然父亲(组=owner,数据节点=parentForTree)起,每层:
+//     无页 → 组:行号=上一层记下的成员行;透传数据父:row=-1 交 rowOf 扫原始序列
+//     有页 → revalidate 后查 entries[node]:
+//            查无 = 本页没投影它(被过滤)→ {p,-1}
+//            container==p = 直属 flat 行 → {p,row}
+//            container==组 → 记住(组,成员行),下钻进组继续(组可能有自己的页,deepest-wins)
+std::pair<GuiBase*, int> TreeProjection::locate(GuiBase* node) {
+    if (!node) return { nullptr, -1 };
     GuiBase* p = dynamic_cast<TreeGroup*>(node)
-                 ? static_cast<TreeGroup*>(node)->owner()   // 组的"自然父亲"=owner
-                 : node->parentForTree();                   // 既有虚接口(含 Geom 的 QObject 回退)
+               ? static_cast<TreeGroup*>(node)->owner()   // 组的"自然父亲"=owner
+               : node->parentForTree();                   // 既有虚接口(含 Geom 的 QObject 回退)
+    GuiBase* lastContainer = nullptr;   // 上一层页给出的 container(=当前 p 时,lastRow 即答案行号)
+    int lastRow = -1;
     while (p) {
         auto pit = m_byParent.find(p);
-        if (pit == m_byParent.end()) return p;
+        if (pit == m_byParent.end()) {
+            // p 无页:① p 是组 → 成员序列就是孩子序列,行号=上一层页记下的成员行;
+            //         ② p 是透传数据父 → row=-1,rowOf 兜底扫原始序列(parentOf 不需要行号,免扫)
+            if (lastContainer == p) return { p, lastRow };
+            return { p, -1 };
+        }
         revalidate(p, pit->second);
-        // ★ p 是组页时,revalidate 可能连锁触发 owner 把 p 整组淘汰并拆页
-        //   (成员全灭的组蒸发)→ pit 悬空,必须回查(见 revalidate 第 0 步注释)
-        pit = m_byParent.find(p);
-        if (pit == m_byParent.end()) return p;
-        auto mit = pit->second.memberToGroup.find(node);
-        if (mit == pit->second.memberToGroup.end()) return p;
-        p = mit->second;                       // 进组,继续查组的内层
+        pit = m_byParent.find(p);              // 组页可能被连锁拆页 → 回查
+        if (pit == m_byParent.end()) return { p, -1 };   // 页没了(组已淘汰):按"无页"处理,rowOf 兜底得 -1
+        auto eit = pit->second.entries.find(node);
+        if (eit == pit->second.entries.end()) return { p, -1 };   // 本页没投影它(被过滤/已缺席)
+        lastContainer = eit->second.container;
+        lastRow = eit->second.row;
+        if (eit->second.container == p) return { p, lastRow };    // 直属:flat 行
+        p = eit->second.container;                                // 进组,继续下钻
     }
-    return nullptr;
+    return { nullptr, -1 };
+}
+
+GuiBase* TreeProjection::parentOf(GuiBase* node) {
+    if (!node) return nullptr;
+    return locate(node).first;
 }
 
 int TreeProjection::rowOf(GuiBase* node) {
-    // ★ 纪元在快路径之前开(评审修复 R1,理由见 parentOf 同款注释):
-    //   rowOf 的实现是"parentOf + 扫序列",二者共享本纪元(嵌套不递增),
-    //   否则内层 parentOf 递增纪元会把外层已盖的 checkedAt 作废,优化归零。
-    EpochScope epoch(this);
-    // ★★ 快路径(2026-10-06 落地):位置索引直接查表 —— O(1)。
-    //    旧实现是 parentOf + 线性扫序列,而 parentOf 为了"校验缓存"要枚举整页孩子
-    //    ⇒ 遍历 k 行 = k 次 O(k) ⇒ O(k²)。实测最宽层 5000 时一次展开首屏 76 ms;
-    //    2000 次全树遍历 11.6 s。索引化后与旧实现【逐项对拍 0 差异】
-    //    (985 项全树对拍 + 200 轮随机增删/换规则/重装,见 PROJECT.md)。
-    //    查不到(= 不在任何投影页上:被过滤/已死/没装过)才回退旧路径,语义不变。
-    if (node) {
-        auto pg = m_nodePage.find(node);
-        if (pg != m_nodePage.end()) {
-            auto pit = m_byParent.find(pg->second);
-            if (pit != m_byParent.end()) {
-                // 与 parentOf 同理:本操作纪元内该页没校验过就补一次(每页最多一次),
-                // 然后从索引取行号。校验是必须的 —— 索引可能与当前数据侧不同步
-                // (见 parentOf 里的说明:纪元会被重置,不能凭"引用还在"就采信)。
-                revalidate(pg->second, pit->second);
-                pit = m_byParent.find(pg->second);      // 页可能被连锁拆掉 → 回查
-                if (pit != m_byParent.end()) {
-                    auto mit = pit->second.memberToPos.find(node);
-                    if (mit != pit->second.memberToPos.end()) return mit->second.second;
-                }
-            }
-        }
-    }
-    // ── 回退路径(保持原语义不变;纪元已在函数开头开过)──
-    GuiBase* p = parentOf(node);   // 嵌套调用不递增纪元(见 EpochScope)
-    if (!p) return -1;
-    // ★ 就地取账本序列扫一遍 —— 不再逐位调 child(p,i):
-    //   旧实现每个位置都触发一次完整缓存校验(组路径 = revalidate owner),
-    //   宽父亲(20 万孩子)组的成员一次 rowOf 实测 0.46s = O(组员×父孩子);
-    //   现在整次 rowOf 只校验一遍,回到 O(兄弟数)。
-    auto pit = m_byParent.find(p);
-    if (pit != m_byParent.end()) {
-        revalidate(p, pit->second);            // 唯一一次校验,序列保证新鲜
-        pit = m_byParent.find(p);              // 组页可能被连锁拆页 → 回查
-        if (pit == m_byParent.end()) return -1;
-        const auto& flat = pit->second.flat;
-        for (size_t i = 0; i < flat.size(); ++i)
-            if (flat[i] == node) return (int)i;
-        return -1;
-    }
-    if (auto* g = dynamic_cast<TreeGroup*>(p)) {
-        const auto* mem = freshMembers(g);     // 一次校验 + 就地引用扫描
-        if (!mem) return -1;
-        for (size_t i = 0; i < mem->size(); ++i)
-            if ((*mem)[i] == node) return (int)i;
-        return -1;
-    }
-    size_t n = p->visibleChildrenCount();      // 透传节点:虚接口就地扫
+    if (!node) return -1;
+    auto loc = locate(node);
+    if (!loc.first) return -1;
+    if (loc.second >= 0) return loc.second;    // entries 直接给出(flat 行 或 组成员行)
+    // row=-1 的两种情形:
+    if (m_byParent.count(loc.first)) return -1;   // ① 有页但 entries 查无 = 被过滤 → 不在投影树
+    // ② 透传父亲(无页):就地扫原始序列
+    size_t n = loc.first->visibleChildrenCount();
     for (size_t i = 0; i < n; ++i)
-        if (p->visibleChild(i) == node) return (int)i;
-    return -1;                                 // 被过滤/已死 → 不在投影树上
+        if (loc.first->visibleChild(i) == node) return (int)i;
+    return -1;
 }

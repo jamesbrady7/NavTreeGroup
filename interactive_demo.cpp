@@ -113,7 +113,19 @@ static std::vector<GuiBase*> rawKids(GuiBase* n) {
 // ═══════════════ 政体感知:挂载 ═══════════════
 // 关键:挂到哪个容器由【父的政体】决定;能否挂由【父子政体兼容性】决定。
 // 返回新节点;不兼容时返回 nullptr 并置 err。
+static GuiBase* createAndAttachImpl(GuiBase* parent, const std::string& name,
+                                    Kind kind, const std::string& material,
+                                    std::string& err);
+// ★v4 收口点:一切"增"都经这里 → 挂载成功后 invalidate(parent)(无页时 no-op)。
+//   从此 demo 里不存在"加了节点忘了通知"的路径。
 static GuiBase* createAndAttach(GuiBase* parent, const std::string& name,
+                                Kind kind, const std::string& material,
+                                std::string& err) {
+    GuiBase* c = createAndAttachImpl(parent, name, kind, material, err);
+    if (c) P.invalidate(parent);
+    return c;
+}
+static GuiBase* createAndAttachImpl(GuiBase* parent, const std::string& name,
                                 Kind kind, const std::string& material,
                                 std::string& err) {
     err.clear();
@@ -168,7 +180,12 @@ static GuiBase* createAndAttach(GuiBase* parent, const std::string& name,
 }
 
 // ═══════════════ 政体感知:摘除并删除(子的后代须已清空) ═══════════════
+// ★v4 收口点:一切"删"都经这里 → 动手前 notifyRemove(parent, child)
+//   (= invalidate(parent) + discard(child),两者都必须在 child 死前)。
+//   若 child 还有未清的后代且它们带账页,内部页成僵尸 → 下一次 prune 边界清掉
+//   (onDelete/onRebuild 都自带 prune,structuralReset 路径由 install 的 prune 兜底)。
 static void deleteChildRaw(GuiBase* parent, GuiBase* child) {
+    P.notifyRemove(parent, child);
     // Data 政体:子在父的 subDataGroups 里 → destroySubDataGroup(摘+删)
     if (auto* pd = dynamic_cast<DataObject*>(parent)) {
         if (auto* cd = dynamic_cast<DataObject*>(child)) {
@@ -430,6 +447,10 @@ static void verifyGroups(GuiBase* parent) {
     size_t actual = 0;
     for (size_t i = 0; i < P.childCount(parent); ++i)
         if (P.isGroup(P.child(parent, i))) ++actual;
+    // ⚠ 口径说明(v3 时代就存在的日志口径差,不是失败):多层分组下外层组会把
+    //   内层组【吞进肚子里】—— 顶层组数可以小于注册表里有活成员的手动组数
+    //   (M 电池:应有 2 = [网格]+[所有子结点],实际顶层 1 = [所有子结点] 内含 [网格])。
+    //   嵌套是否保持由 M 电池自己的结构断言负责,这里只做日志观察。
     log("  重建后校验:应有组=" + std::to_string(expected)
         + " 实际组=" + std::to_string(actual)
         + (actual == expected ? " → 分组存活 ✓" : " → 不一致 ✗"));
@@ -885,7 +906,7 @@ static void updateStressStatus() {
     s += "\n引擎: 存活组 = " + std::to_string(P.liveGroupCount())
        + "   待回收 = " + std::to_string(P.retiredCount())
        + "   投影树规模 = " + std::to_string(P.childCount(g_stressRoot ? g_stressRoot : g_root)) + " 行(根层)";
-    s += "   纪元优化 = " + std::string(P.epochOptimizationEnabled() ? "开" : "关");
+    s += "   漏报检测(paranoid) = " + std::string(P.paranoidChecks() ? "开" : "关");
     g_stressStatus->setText(QString::fromStdString(s));
     if (g_stressBar) g_stressBar->setEnabled(true);
 }
@@ -1209,8 +1230,12 @@ static int runSelfTest() {
         if (qg) {
             const void* addrBefore = qg;
             size_t retiredBefore = P.retiredCount();
-            // 裸删全部成员(零通知,不走任何引擎 API)
-            for (auto* d : qp) rootQ->destroySubDataGroup(d);
+            // v4:删除要通知(notifyRemove 在 delete 前);v3 这里是零通知裸删靠枚举发现。
+            // 契约主体不变:通知只置脏标志,真正让组蒸发的仍是下面那一句【纯读】。
+            for (auto* d : qp) {
+                P.notifyRemove(rootQ, d);
+                rootQ->destroySubDataGroup(d);
+            }
             // ★ 只问一句【只读查询】—— 这一句过去会 delete 组
             (void)P.childCount(rootQ);
             check(findGroupByLabel(rootQ, "QM") == nullptr,
@@ -1219,6 +1244,7 @@ static int runSelfTest() {
                   "Q ★读侧不释放:组进待回收队列而非被 delete(修 UAF)");
             // 补新成员 → 组重生,验证地址未被复用
             rootQ->addSubDataGroup(new PartObject("QNew", "QM", rootQ));
+            P.invalidate(rootQ);                       // ★v4:新增通知
             (void)P.childCount(rootQ);
             TreeGroup* qg2 = findGroupByLabel(rootQ, "QM");
             check(qg2 != nullptr && (const void*)qg2 != addrBefore,
