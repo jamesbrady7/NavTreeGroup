@@ -15,7 +15,9 @@
 > `[实测]` = 跑过命令/探针,有输出证据 · `[读码]` = 只做过源码审读,未独立运行验证
 > · `[论证]` = 只有推理,无实证(必须写出"为什么暂时无法实证")
 >
-> 最后更新:实现方(第三轮)—— **PROJECT.md §5 缺口清单已全部关闭**(#1/#2/#3/#4/#6 + ASan 替代实证)。
+> 最后更新:**第三方评审(2026-10-06 入网前检视)** —— 探针实证并修复 R1(裸坐标陈旧,高危)/
+> R2(m_nodePage 泄漏,中危)/R3(组上求值 locate,低危);回归固化 T22/T23 + probe_review 目标。
+> 此前:实现方(第三轮)§5 缺口清单全部关闭(#1/#2/#3/#4/#6 + ASan 替代实证)。
 > 改动请在此追加一行"变更记录"。
 
 ---
@@ -26,8 +28,8 @@
 |---|---|
 | 目标 | 把数据侧三政体原始树,"惰性投影"成带分组/过滤/排序的展示树 |
 | 语言/工具链 | C++17 · MSVC(VS2019, 14.29) · Qt 5.15.2 msvc2019_64 · CMake ≥3.16 VS 生成器 |
-| 源码规模 | 非 build 文件 27 个;引擎核心 4 个文件(treeprojection.h/.cpp、pipeline.h、ptrset.h) |
-| 构建产物 | 6 个可执行:`navtree_demo` `gui_demo` `tree_tabs` `unit_tests` `interactive_demo` `bench` |
+| 源码规模 | 非 build 文件 28 个;引擎核心 4 个文件(treeprojection.h/.cpp、pipeline.h、ptrset.h) |
+| 构建产物 | 7 个可执行:`navtree_demo` `gui_demo` `tree_tabs` `unit_tests` `interactive_demo` `bench` `probe_review`(评审探针) |
 | **不做 add_library** | 决策:内网**直接集成源码**,不抽静态库。(本项已定,勿再提议) |
 | 集成硬依赖 | `unit_tests` **需要 Qt5::Test**(T18 用了 `QAbstractItemModelTester`);其余 5 个目标只依赖 Core(2 个 GUI 目标额外 Widgets) |
 | Debug 自检行为 | `unit_tests` 的 `main` 已调 `silenceCrtDialogs()`(`tests.cpp`):`_CrtSetReportMode` **逐类型**设 `_CRTDBG_MODE_FILE` + `SetErrorMode(...)`。**Debug 版跑测试不再弹 MessageBox** —— 此前堆损坏/QFatal 会弹框阻塞,使"退出码=失败数"契约失效并盖住现场。⚠ 若看到弹框,说明有人回退了这个函数 |
@@ -54,6 +56,7 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 & "$P\build\Release\bench.exe" cold,regroup  # C4 实证:换规则 → 延迟释放峰值      ← 有前置依赖
 & "$P\build\Release\bench.exe" gcstress    # 内存安全压测(Release 只查泄漏)
 & "$P\build\Debug\bench.exe"   gcstress    # ★Debug 版才有 _CrtCheckMemory 堆校验
+& "$P\build\Release\probe_review.exe"      # 评审探针:R1/R2/R3 三疑点,期望 summary: 0 confirmed
 ```
 
 ### ⚠ bench 场景的【前置依赖】(2026-10-06 交叉验证发现 —— 以前是个假绿灯)
@@ -329,8 +332,8 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 |---|---|---|
 | `build-1M`(数据侧建树,引擎无关) | ~112 ms | 1,010,101 节点 |
 | `cold-bind`(bindSpec+rebind 装 1 万父) | **~523 ms** | 含全树 DFS + prune(区间 495~527,机器噪声 ±10%) |
-| `rowcount-cache-hit` | ~450-640 ns/op | 模型 `rowCount` 热路径(区间噪声大) |
-| `parentOf+rowOf` | **~2440 ns/op** | 读侧四件套最贵的一对 |
+| `rowcount-cache-hit` | ~390-640 ns/op | 模型 `rowCount` 热路径(区间噪声大) |
+| `parentOf+rowOf` | **~1340 ns/op**(R1 后实测) | ⚠ 改造中期曾报 ~959 ns/op —— 那个数字靠"快路径不开纪元"的不健全跳过换来(R1 陈旧坐标 bug),已随修复作废;现值仍优于索引化前的 ~2440 |
 | `model-full-dfs` | 1,110,100 节点 | 投影后含组,>原始节点数 |
 | `rebuild-channel` | **~1006 ms** | wipe 115 + 重建 69 + prune冷 641 + walk 181 |
 | `prune-1M` | **~130 ms** | 全树可达性剪枝(区间 120~140) |
@@ -412,7 +415,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 | 目标 | 期望 | 实测(Release / Debug) |
 |---|---|---|
-| `unit_tests` | 退出码 = 失败块数 = 0 | **20 块 / 70 条断言全绿**(2026-10-05);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
+| `unit_tests` | 退出码 = 失败块数 = 0 | **23 块全绿,双配置**(2026-10-06 评审轮:新增 T22 裸坐标新鲜度 / T23 m_nodePage 清理;T21 阈值改为分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
 | `navtree_demo` | 退出码 0,不变量通过 | ✔ 通过 |
 | `gui_demo` | 退出码 0 | ✔ 模型不变量 13 项 + 终检 10 项 |
 | `tree_tabs --selftest` | `selftest PASS` | ✔ |
@@ -424,6 +427,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 | `bench gcstress` | 残留=0、无堆损坏、无累积泄漏 | ✔ Debug:200 轮(100 轮走 prune 野 key 路径)堆校验 **0 失败**;Release:`[SKIP]` 堆校验、WS +3.0 MB。详见 §5「ASan 替代实证」 |
 | `bench cold,<场景>` × 9 | exit=0 | ✔ 依赖账本的 9 个场景(`hot/query/model/incr/rebuild/prune/iloop/mem/regroup`)必须带 `cold` 前缀 |
 | `bench <场景>` × 9(单跑) | **故意 exit=1** | ✔ 缺前置 = 测量无效,显式判失败(旧行为是静默给 0 + exit 0,那才是 bug) |
+| `probe_review` | `summary: 0 confirmed` | ✔ 三疑点(纪元缺口/索引清理/组上求值 locate)修复后全 OK(2026-10-06 评审轮) |
 
 ### bench 的 CHECK 退出码契约(2026-10-05 新增,踩坑换来的)
 
@@ -570,5 +574,6 @@ gcstress-x200  200 轮(含 prune 剪枝路径 100 轮) | 残留待回收累计=0
 | **2026-10-06(验证方补:压力树 demo)** | 给 `interactive_demo` 加"压力树"(可选装,供手工把玩)+ **R 电池**自证。树规模实测:543 节点 = 506 Part + 25 Folder + 6 Mesh + 3 Geom + 3 Data;24 层深链;500 直属孩子的宽父亲;第二棵独立树。**过程中暴露并修掉 4 个"树构造"层面的坑**(都不是引擎缺陷,但都会让全树不变量变红,值得留痕):① 挂进 Mesh 的 Part 用 `PartObject(name,mat,nullptr)` ⇒ `parentForTree()==null` ⇒ `parentOf` 返回 null,正解是走有 `treeParent` 形参的构造(`MeshPart`);② **组 key 必须按页唯一** —— 多页各建同名 `Titan 件` 会被 `matchReusable` 按 key 互相 cull,被 cull 的组 owner 被 erase,其成员 `parentOf` 变 null(这条是**引擎既有语义的正确用法**,不是 bug);③ Mesh 节点必须也装页,否则它的孩子 `parentOf` 会跳过它;④ 安装走查必须"数据孩子 + 组再下钻一层",否则被组盖住的节点漏装 | `[实测]` 双配置 **0 错误 0 警告**;六目标 × 双配置 exit 全 0;`interactive_demo --selftest` **PASS(16 条 R 断言全绿)**;`bench all` × 双配置 `CHECK!=0` |
 | **2026-10-06(验证方补:压力树控制台)** | 应"想在界面上直接操作这棵树"的诉求,给 `interactive_demo` 加**顶部压力树控制台**:一行按钮 + **选中节点投影坐标状态板**(投影父亲/行号/投影孩子 vs 原始孩子/自然父亲/存活组/待回收/纪元开关),并把 `log()`/`structuralReset()` 接上状态刷新。新增 **S 电池**无头驱动那三个规则按钮(平时只能鼠标点到),断言切换后全树 `parentOf/rowOf` 仍自洽、类型组确实建出、清除后透传且无重复。**过程中修掉一个自己的接线 bug**:控制台先于 `view/model` 创建,状态刷新里直接解引用 `g_view->selectionModel()` → 启动即 0xC0000005 访问违例(已加空指针守卫) | `[实测]` 双配置 0 错误 0 警告;`interactive_demo --selftest` PASS(R 16 + S 8) |
 | **2026-10-06(引擎性能:位置索引 + 诚实的结论)** | **问题定位**(用户反馈"交互巨卡"):模型对每行都问 `parentOf`/`rowOf`,旧实现为给答案必须 `revalidate`→`liveMatchesLast` **全枚举该页孩子**;且**每次模型调用都是独立操作(各开纪元)**,页级校验无法跨调用复用 ⇒ 遍历 k 行 = k×O(k) = **O(k²)**。实测最宽层 5000 时 `parentOf` 8.59 µs;而**全量重算只要 1.2~2.8 ms**(占 1.5%,故重算侧无需优化)。**改法**:每页 `memberToPos[节点]=(投影父亲,行号)` + 全局 `m_nodePage[节点]=所属页`,`parentOf`/`rowOf` 先按页校验一次再查索引;`dropProjection` 按本页键集点查清理。**关键陷阱**(诊断实证):行号**不能**用自然父亲 `flat` 的位置 —— 被分组的成员不在自然父亲 flat 里(那里放的是组),其行号是"在所在组成员序列里的位置",必须成对存 (父亲,行号)。**⚠ 诚实结论**:索引让"查表"部分变 O(1),但**跨调用 O(k²) 没有消除** —— 实测(k=500/2000/5000/10000/20000 的一次全树遍历)0.35/5.16/32.4/121/485 ms,仍是超线性;计数探针证明 `N=10000` 遍历中数据侧枚举被调 **100,050,002** 次(每行 ≈k)。**要真正消除只有一条路**:数据侧提供变更信号(脏标记/版本号),使引擎不必靠枚举发现变化 —— 属数据层契约变更,不在本次范围。**两次尝试"跨操作复用成员表指针"均引入难以复现的陈旧读**(T16 在 Debug 稳定失败/Release 通过),已按正确性优先整段撤除。**内存代价**:`memberToPos` 74.3 MB + `m_nodePage` 65.9 MB,账本 88.4→**228.6 MB/百万被投影节点**,峰值工作集 299→**496 MB**。**回归护栏**:新增 **T21**(宽节点读侧 + 全树不变量),`unit_tests` 21 块 | `[实测]` 双配置 0 错误 0 警告;六目标 × 双配置 exit 全 0;`unit_tests` 21 块全绿(含 T16/T21);`bench all` × 双配置 `CHECK!=0` |
+| **2026-10-06(第三方评审:入网前检视,发现并修复 R1/R2/R3)** | 评审方独立复验(clean build 双配置 0 错误 0 警告;15 项回归 exit 全 0;日志无 FAIL/CHECK!/MISMATCH)+ 写探针 `probe_review.cpp` 实证三个读码疑点。**坐实并修复三处**:① **R1(高危,正确性)**:`parentOf`/`rowOf` 的位置索引快路径在 `EpochScope` 之前执行 → 裸调用不递增纪元 → 快路径内 revalidate 把"上一操作校验过"误当"本操作校验过",数据侧静默变更后返回**陈旧坐标**(探针实证:删 L1 后裸 `rowOf(L3)` 答 1,真值 0)。生产触发面:连续多次精准删除之间无 rowCount 调用时,`beginRemoveRows` 拿到含死者的旧行号(gui_demo 因 Op 间有 dumpModel 而从未暴露)。修复 = 纪元在快路径前开(每操作首触页必重枚举,同操作内仍 O(1))。代价:`parentOf+rowOf` 959→**1342 ns/op**(旧值靠不健全跳过,作废);T21 Debug 诚实成本 ~13 s → **阈值改分配置**(Release 2 s/Debug 30 s,护栏仍能抓 ×600 的真爆炸)。② **R2(中危,内存)**:`dropProjection` 的 `m_nodePage` 清理键集收的是 flat+members 的**组键**(kv.first),漏掉各组成员(kv.second)→ 探针实证 6 条只清 2 条;答案正确性靠快路径查空回退兜底,但条目随组变更单调积累。修复 = 清理直接遍历 `memberToPos` 键集(与登记循环对称同源,不可能再漂移)。③ **R3(低危,契约字面)**:`walkBindings` 条件 `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` 会对组节点**求值 locate**(探针实证 4 次)——违反不变量#3 的字面承诺,用户 locate 若对组做无防御 cast 即 UB。修复 = 先判非组再求值(位图门控收益保留)。回归固化:新增 **T22**(裸坐标新鲜度,分辨力:去掉 R1 修复必红)/ **T23**(拆页清理,分辨力:换回旧写法必红);`probe_review` 加入构建(第 7 目标)。**修复后全绿**:23 块 × 双配置、七目标回归、probe 0 confirmed、bench all/deep/dbg/gcstress/mem/regroup/cold-prune × 双配置 exit 全 0 | `[实测]` 探针修复前:P1 CONFIRMED(stale 1≠0)/P2 CONFIRMED(2/6)/P3 CONFIRMED(4 次);修复后全 OK |
 | **2026-10-06(验证方补:启动即进压力树 + 形态澄清)** | 用户反馈"没看出是改造后的树"。**澄清:代码本来就是 model–view 形态**(`QTreeView` + `NavTreeModel : QAbstractItemModel`,模型只经 `ITreeSource` 读引擎,回归里有 `QAbstractItemModelTester`)。真正的问题是**压力树要手点按钮才出现**,默认看到的是初始树。修正:①**启动即构造压力树并切到它**(交互态无需点按钮);②控制台改为"显示压力树 / 显示初始树"**视图切换**(模型换 root,引擎同一套);③拆树后自动切回初始树(否则模型挂着已删 root);④主程序收尾补充压力树的政体感知清理;⑤新增 **`--smoke` 冒烟模式**,无头打印"界面此刻该显示什么"并点一次规则按钮 —— 实测 `模型 root = 压力装配体 / 存活组 = 18 / 根层 8 行 / 按钮 9 个`,切按类型后 `存活组 5 / 根层 5 行` | `[实测]` 双配置 **0 错误 0 警告**;六目标 × 双配置 + `--smoke` 全 exit 0;`bench all` × 双配置 `CHECK!=0` |
 

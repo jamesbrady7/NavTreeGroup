@@ -851,7 +851,21 @@ static void t21_wideReadCost() {
     showOut("投影节点 " + std::to_string(nodes.size()) + " 个,全树 parentOf+rowOf = "
             + std::to_string(ms) + " ms");
     check(ok, "T21 前置:宽节点全树不变量成立(索引化不能改答案)");
-    check(ms < 2000.0, "★宽节点读侧没退化成秒级(" + std::to_string(ms) + " ms < 2000 ms)");
+    // ★ 阈值分配置(评审修复 R1 之后必须如此,2026-10-06):
+    //   R1 恢复了"每个操作必重枚举"的跨调用新鲜度(parentOf/rowOf 快路径之前开纪元)——
+    //   这是正确性要求(裸坐标查询吃过陈旧账本,探针 P1 实证)。代价:遍历 k 行
+    //   回到 O(k×页宽) 的诚实成本(PROJECT.md §3 本就声明跨调用 O(k²) 未消除)。
+    //   本页是 DataObject 政体(每次 visibleChild 都 O(n) 重填)→ Debug 无优化下
+    //   603 次查询 ≈ 13 s,是语义的必然成本,不是退化。
+    //   Release 阈值 2 s 不变;Debug 阈值 30 s —— 仍能抓住真爆炸
+    //   (若有人把 revalidate 塞进逐元素循环,这里会 ×600 → 远超任何阈值)。
+#ifdef _DEBUG
+    const double limit = 30000.0;
+#else
+    const double limit = 2000.0;
+#endif
+    check(ms < limit, "★宽节点读侧无病态退化(" + std::to_string(ms) + " ms < "
+          + std::to_string(limit) + " ms,阈值分配置)");
 
     P.uninstall(root);
     P.unregisterRoot(root);
@@ -949,20 +963,110 @@ static void t20_epochEscapeHatch() {
     freeWorld(w);
 }
 
+// T22:裸坐标查询的新鲜度(评审修复 R1 的回归,2026-10-06)
+//   病灶:parentOf/rowOf 的快路径曾在 EpochScope 之前执行 —— 裸调用不递增纪元,
+//   快路径内 revalidate 的闸门把"上一操作校验过"误当"本操作校验过",
+//   数据侧静默变更后返回【陈旧坐标】。探针实证(probe_review P1):
+//   删 L1 后裸 rowOf(L3) 答 1(真值 0)。修复 = 纪元在快路径之前开。
+//   分辨力:去掉 parentOf/rowOf 开头的 EpochScope,本块第 2 条断言必红(答 1)。
+static void t22_bareCoordFreshness() {
+    hdr("T22", "裸坐标查询新鲜度(R1 回归)",
+        "数据侧静默删除后,不经 childCount 直接 parentOf/rowOf 也必须给新鲜答案");
+    auto* root = new NamedData("R22");
+    auto* flat = new FolderObject("页", root);
+    root->addSubDataGroup(flat);
+    // ⚠ DataObject 构造只记反向指针,【不】自动挂进 sup 的 m_subDataGroups
+    //   —— 必须显式 addSubDataGroup,否则节点根本不在树上(第一版就漏了 L1/L3)
+    auto* l1 = new PartObject("L1", "A", flat);
+    flat->addSubDataGroup(l1);
+    auto* l2 = new PartObject("L2", "B", flat);
+    flat->addSubDataGroup(l2);
+    auto* l3 = new PartObject("L3", "A", flat);
+    flat->addSubDataGroup(l3);
+    auto* l4 = new PartObject("L4", "B", flat);
+    flat->addSubDataGroup(l4);
+    P.registerRoot(root);
+    ProjectionSpec sp;
+    sp.grouping = GroupRules::byKey([](GuiBase* n) {
+        auto* p = dynamic_cast<PartObject*>(n);
+        return p ? p->material() : std::string();
+    });
+    sp.opt.dynamicAll = true;
+    P.install(flat, sp, {});            // GA=[L1,L3]  GB=[L2,L4]
+    showIn("页装投影(材料 2 组);先 childCount 校验建索引,再静默删 L1");
+
+    (void)P.childCount(flat);           // op1:校验 + 位置索引登记(L3 → GA 行 1)
+    check(P.rowOf(l3) == 1, "① 前置:GA=[L1,L3],L3 行号 = 1");
+
+    flat->destroySubDataGroup(l1);      // 数据侧静默删除(引擎不感知,靠惰性发现)
+
+    // ★ 关键断言:下一个引擎调用是【裸 rowOf】(不开纪元的旧实现会吃 op1 的陈旧账)
+    int r = P.rowOf(l3);
+    showOut("删 L1 后裸 rowOf(L3) = " + std::to_string(r) + "(真值 0,陈旧值 1)");
+    check(r == 0, "★② 裸 rowOf(L3)=0:静默变更后快路径不吃陈旧账本(R1)");
+    GuiBase* par = P.parentOf(l3);      // 裸 parentOf 同样必须新鲜
+    check(par && P.isGroup(par) && P.childCount(par) == 1,
+          "③ 裸 parentOf(L3)=GA 且 GA 只剩 1 员");
+
+    P.uninstall(flat);
+    P.unregisterRoot(root);
+    P.collectGarbage();
+    clearData(root);
+    delete root;
+}
+
+// T23:拆页时 m_nodePage 位置索引的清理(评审修复 R2 的回归,2026-10-06)
+//   病灶:dropProjection 的清理键集曾收 flat + members 的【组键】,漏掉各组
+//   【成员】—— 与登记键集(memberToPos 的键)不对称,成员条目永久残留。
+//   探针实证(probe_review P2):6 条只清 2 条。答案正确性靠快路径查空回退兜底,
+//   但 m_nodePage 随组变更单调积累 = 内存泄漏。修复 = 清理直接遍历 memberToPos 键。
+//   分辨力:把清理循环换回旧写法(flat+组键),本块断言必红(差值 2 ≠ 6)。
+static void t23_nodePageCleanup() {
+    hdr("T23", "m_nodePage 拆页清理(R2 回归)",
+        "uninstall 后本页位置索引条目(2 组 + 4 成员 = 6 条)必须全部清除");
+    auto* root = new NamedData("R23");
+    auto* flat = new FolderObject("页", root);
+    root->addSubDataGroup(flat);
+    for (int i = 0; i < 4; ++i)
+        flat->addSubDataGroup(new PartObject("L" + std::to_string(i), (i % 2) ? "B" : "A", flat));
+    P.registerRoot(root);
+    ProjectionSpec sp;
+    sp.grouping = GroupRules::byKey([](GuiBase* n) {
+        auto* p = dynamic_cast<PartObject*>(n);
+        return p ? p->material() : std::string();
+    });
+    sp.opt.dynamicAll = true;
+    P.install(flat, sp, {});
+    (void)P.childCount(flat);           // 建索引:flat 2 组 + 4 成员 = 6 条
+    size_t before = P.memoryBreakdown().nodePage;
+    showIn("页装投影并建索引,nodePage 基线 = " + std::to_string(before));
+
+    P.uninstall(flat);
+    size_t after = P.memoryBreakdown().nodePage;
+    showOut("uninstall 后 nodePage = " + std::to_string(after) + "(应减少 6)");
+    check(before >= 6 && after == before - 6,
+          "★拆页清掉全部 6 条位置索引(旧 bug:只清 2 条、泄漏 4 条)");
+
+    P.unregisterRoot(root);
+    P.collectGarbage();
+    clearData(root);
+    delete root;
+}
+
 int main() {
     silenceCrtDialogs();
 #ifdef Q_OS_WIN
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    printf("NavTreeGroup unit_tests:21 块,每块打印 职责/输入/输出/校验\n");
+    printf("NavTreeGroup unit_tests:23 块,每块打印 职责/输入/输出/校验\n");
     t1_filter();  t2_bucket();  t3_collapse(); t4_reuse(); t5_flat(); t6_sort();
     t7_endToEnd(); t8_cache(); t9_rowOf(); t10_evaporate(); t11_multiLayer(); t12_deathOfOwner();
     t13_prune(); t14_rebind();
     t15_model(); t16_signals();
     t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_epochEscapeHatch();
-    t21_wideReadCost();
+    t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup();
     printf("\n══════ 汇总:%s(失败块数 = %d,即退出码)══════\n",
-           g_fail ? "有 FAIL" : "21 块全绿", g_fail);
+           g_fail ? "有 FAIL" : "23 块全绿", g_fail);
     printf("engine live groups at exit = %d\n", (int)P.liveGroupCount());
     return g_fail ? 1 : 0;
 }

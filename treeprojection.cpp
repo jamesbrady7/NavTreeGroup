@@ -494,16 +494,16 @@ void TreeProjection::dropProjection(GuiBase* parent, bool deferDelete) {
     if (it == m_byParent.end()) return;
     Projection& p = it->second;
     // ★ 位置索引必须与本页同生共死:先把"可能指向本页的键"收齐再删。
-    //   为什么不能边删边查:节点出现在本页的 flat(直属/本层组)里,而被分组的成员
-    //   只在【组的 members】里 —— 两处都要覆盖(即 memberToPos 的键集)。
     //   点查删除而不按值扫全表,是为了避免 O(节点总数) 的拆页成本。
+    // ★ 键集直接取 memberToPos 的键(评审修复 R2,2026-10-06):
+    //   登记循环就是 `for (kv : memberToPos) m_nodePage[kv.first] = parent`,
+    //   清理与登记【对称同源】,不可能漂移。旧实现收的是 flat + members 的
+    //   【组键】(kv.first),漏掉了各组成员(kv.second)—— 探针实证(probe P2):
+    //   6 条只清掉 2 条,4 条组成员条目永久残留(靠快路径查不到时回退兜底,
+    //   答案仍正确,但 m_nodePage 随组变更单调积累 = 内存泄漏)。
     {
-        std::vector<GuiBase*> keys;
-        keys.reserve(p.memberToPos.size());
-        for (GuiBase* x : p.flat) keys.push_back(x);
-        for (const auto& kv : p.members) keys.push_back(kv.first);
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto nit = m_nodePage.find(keys[i]);
+        for (const auto& kv : p.memberToPos) {
+            auto nit = m_nodePage.find(kv.first);
             if (nit != m_nodePage.end() && nit->second == parent) m_nodePage.erase(nit);
         }
     }
@@ -661,9 +661,17 @@ void TreeProjection::walkBindings(GuiBase* root, PtrSet& seen) {
         // ★ 绑定谓词【不对组节点求值】:组是投影产物不是数据节点。否则当组 label
         //   与 locate 特征同名时,会对组再装投影 → 组内成员又被同规则分出内层组 →
         //   内层组 label 仍同名 → 无限嵌套(实测栈/堆耗尽崩在 operator new)。
-        for (auto& b : m_bindings)
-            if (b.locate(n) && (maybeGroup ? !isGroup(n) : true))
-                installFromBinding(n, b);   // 同绑定豁免:表没变 → 只校验缓存,不强制重算
+        // ★ 先判"不是组"再求值 locate(评审修复 R3,2026-10-06):
+        //   旧写法 `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` 会对组节点
+        //   求值 locate(只是不安装)—— 违反不变量#3 的字面承诺"绑定谓词不对
+        //   组节点求值"(探针实证 4 次)。用户的 locate 若对组做无防御的
+        //   static_cast/成员访问就是未定义行为。求值顺序换回来,
+        //   位图门控的收益保留(无组提示 ⇒ 免 dynamic_cast 直接放行到 locate)。
+        const bool notGroup = maybeGroup ? !isGroup(n) : true;
+        if (notGroup)
+            for (auto& b : m_bindings)
+                if (b.locate(n))
+                    installFromBinding(n, b);   // 同绑定豁免:表没变 → 只校验缓存,不强制重算
         auto pit = m_byParent.end();
         if (hintProbe(m_pageHint, n)) pit = m_byParent.find(n);
         if (pit != m_byParent.end()) {
@@ -746,6 +754,14 @@ GuiBase* TreeProjection::child(GuiBase* node, size_t i) {
 
 GuiBase* TreeProjection::parentOf(GuiBase* node) {
     if (!node) return nullptr;
+    // ★ 纪元必须在【快路径之前】开(评审修复 R1,2026-10-06):
+    //   快路径内部的 revalidate 依赖"当前纪元"做闸门。若本函数不开纪元,
+    //   m_queryEpoch 还停在上一次操作 —— 数据侧静默变更后,闸门会把
+    //   "上一操作校验过"误当"本操作校验过" → 返回陈旧坐标。
+    //   探针实证(probe_review P1):删 L1 后裸 rowOf(L3) 答 1(真值 0)。
+    //   开纪元后:每个操作首次触页必重枚举(与旧实现语义一致),
+    //   同操作内后续查询仍吃 O(1) 索引 —— 快慢两层都保住。
+    EpochScope epoch(this);
     // ★★ 快路径(2026-10-06 落地):位置索引直接查表 —— O(1)。
     //    账本里 memberToPos 存的 first 就是【已解析好的投影父亲】(被分组就是那个组,
     //    没进组就是自然父亲),这正是本函数的返回值 —— 不需要再下钻、也不需要校验。
@@ -772,8 +788,7 @@ GuiBase* TreeProjection::parentOf(GuiBase* node) {
             }
         }
     }
-    // ── 回退路径(保持原语义不变)──
-    EpochScope epoch(this);   // 下钻链每层都要 revalidate,纪元让同层只校一次
+    // ── 回退路径(保持原语义不变;纪元已在函数开头开过,嵌套不再递增)──
     // ★ 多层分组:组本身也可能是外层组的成员 —— 所以组不直接返回 owner,
     //   而是从 owner 出发和普通节点走同一条下钻链(每层查该层 memberToGroup),
     //   终止于"没装投影"或"这层没把它分组"→ 天然 deepest-wins,无全局反查表
@@ -796,6 +811,10 @@ GuiBase* TreeProjection::parentOf(GuiBase* node) {
 }
 
 int TreeProjection::rowOf(GuiBase* node) {
+    // ★ 纪元在快路径之前开(评审修复 R1,理由见 parentOf 同款注释):
+    //   rowOf 的实现是"parentOf + 扫序列",二者共享本纪元(嵌套不递增),
+    //   否则内层 parentOf 递增纪元会把外层已盖的 checkedAt 作废,优化归零。
+    EpochScope epoch(this);
     // ★★ 快路径(2026-10-06 落地):位置索引直接查表 —— O(1)。
     //    旧实现是 parentOf + 线性扫序列,而 parentOf 为了"校验缓存"要枚举整页孩子
     //    ⇒ 遍历 k 行 = k 次 O(k) ⇒ O(k²)。实测最宽层 5000 时一次展开首屏 76 ms;
@@ -819,11 +838,7 @@ int TreeProjection::rowOf(GuiBase* node) {
             }
         }
     }
-    // ── 回退路径(保持原语义不变)──
-    // ★ 本函数自己开纪元而不是靠 parentOf:rowOf 的实现是 parentOf + 扫序列,
-    //   二者必须是【同一次操作】(共享纪元)—— 否则内层 parentOf 递增纪元后,
-    //   外层随后对同一页的 revalidate 会因纪元不符而重校验,优化归零。
-    EpochScope epoch(this);
+    // ── 回退路径(保持原语义不变;纪元已在函数开头开过)──
     GuiBase* p = parentOf(node);   // 嵌套调用不递增纪元(见 EpochScope)
     if (!p) return -1;
     // ★ 就地取账本序列扫一遍 —— 不再逐位调 child(p,i):

@@ -62,6 +62,14 @@ add_executable(bench
 )
 target_link_libraries(bench Qt5::Core)
 
+# 评审方独立探针(2026-10-06 入网评审):实证三个读码疑点,输出 [CONFIRMED]/[OK]
+add_executable(probe_review
+    probe_review.cpp
+    treeprojection.cpp
+    navtreemodel.h
+)
+target_link_libraries(probe_review Qt5::Core)
+
 if(MSVC)
     # /utf-8 :源码含中文注释/字符串,MSVC 默认按 GBK 解码 → 一堆莫名语法错误
     # /W3    :从"几乎关闭"(默认 /W1)提到常规级别。会暴露一批真实问题
@@ -74,7 +82,7 @@ if(MSVC)
     #      ★ 代价是真实的:C4474 被屏蔽 = printf 参数类型/数量检查失效,
     #        以后真的写错参数也不会报。所以格式串里的符号一律换 ASCII,
     #        而不是加 /wd4474 把它静音。
-    set(NT_TARGETS navtree_demo gui_demo tree_tabs unit_tests interactive_demo bench)
+    set(NT_TARGETS navtree_demo gui_demo tree_tabs unit_tests interactive_demo bench probe_review)
 
     # ── /W3 噪声豁免(逐条,附理由;不要整体静音)──────────────────────
     # 4127: "conditional expression is constant" —— Qt 的 Q_UNUSED / Q_ASSERT
