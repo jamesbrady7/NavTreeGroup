@@ -1068,20 +1068,117 @@ static void t23_nodePageCleanup() {
     delete root;
 }
 
+// T24:空壳组 —— 规则输出【自相矛盾】的专项回归
+//   场景:"不再有任何节点属于 Inner" 与 "Inner 属于 Outer" 同时成立。
+//   后者来自"按名字收组"(登记表里写着 Inner 的名字),前者来自"登记被删/改名/被过滤"。
+//   旧行为:Inner 被当成"沦为成员的旧组"保护下来,但它已经【没有任何成员】
+//   → 视图上 Outer 底下挂一个零成员的空组行;而且它不在 page.groups 里
+//   → dropProjection/uninstall 碰不到它 → liveGroupCount() 也数不到它
+//   → **静默泄漏,连"退出时活组=0"这条断言都抓不到**。
+//   ★ 本块的主判据不是"看不到空壳",而是恒等式
+//        m_groupOwner 条目数 == liveGroupCount()
+//     —— "组归属表"与"活组账本"必须一致;空壳(活着但不归任何页管)会打破它。
+//   分辨力:去掉 revalidate 里的 closeMembership 调用 →
+//     ① childCount(Outer)==1 变 2 ② 归属表等式变 2==1 —— 两行都会红。
+static void t24_shellGroup() {
+    hdr("T24", "空壳组(规则自相矛盾:自己的成员没了,却还被别的组收着)",
+        "内层组失去成员后必须退役;归属表条目数必须恒等于活组数(空壳会打破该等式)");
+    auto* root = new NamedData("R24");
+    auto* a = new PartObject("A", "M", root);
+    auto* b = new PartObject("B", "M", root);
+    auto* c = new PartObject("C", "M", root);
+    root->addSubDataGroup(a);
+    root->addSubDataGroup(b);
+    root->addSubDataGroup(c);
+
+    bool hasInner = true;        // A/B 是否仍给 Inner 出票(关掉 = 内层组失去全部成员)
+    ProjectionSpec spec;
+    spec.grouping = [&](GuiBase* n) -> std::optional<GroupTicket> {
+        if (auto* g = dynamic_cast<TreeGroup*>(n)) {
+            // ★ 只收 key=="Inner" 的组,否则 Outer 会把自己也收进去(无限套娃)
+            if (g->ticket().key != "Inner") return std::nullopt;
+            GroupTicket t; t.key = "Outer"; t.label = "Outer"; return t;
+        }
+        if (auto* p = dynamic_cast<PartObject*>(n)) {
+            if (demoNodeName(p) == "C") {                      // C 一直属于 Outer(外层不会变空)
+                GroupTicket t; t.key = "Outer"; t.label = "Outer"; return t;
+            }
+            if (hasInner) {                                    // A/B 进 Inner(可关掉)
+                GroupTicket t; t.key = "Inner"; t.label = "Inner"; return t;
+            }
+        }
+        return std::nullopt;
+    };
+    spec.opt.dynamicAll = true;
+    P.registerRoot(root);
+
+    // 两次 install:第一次只有数据节点 → 只建 Inner;第二次 Inner 作为旧组被收进 Outer
+    P.install(root, spec, {});
+    P.install(root, spec, {});
+    TreeGroup* outer = findGroup(root, "Outer");
+    TreeGroup* inner = outer ? dynamic_cast<TreeGroup*>(P.child(outer, 0)) : nullptr;
+    showIn("两层: root -> Outer -> Inner -> {A,B};另有直属 C");
+    if (!outer || !inner) {
+        check(false, "T24 前置:两层嵌套没建起来(显式判失败,不许静默 return)");
+        P.uninstall(root); P.unregisterRoot(root); P.collectGarbage(); clearData(root); delete root;
+        return;
+    }
+    // 前置同时是"合法嵌套不被误杀"的基线:活的嵌套组必须原样存活
+    check(P.childCount(outer) == 2 && P.childCount(inner) == 2
+          && P.parentOf(a) == inner && P.parentOf(c) == outer,
+          "T24 前置:Outer=[Inner,C]、Inner=[A,B],坐标逐层正确(活嵌套的基线)");
+
+    const size_t ownerEntries = P.memoryBreakdown().groupOwner;
+    showOut("基线:活组=" + std::to_string(P.liveGroupCount())
+            + " 归属表条目=" + std::to_string(ownerEntries));
+    check(ownerEntries == P.liveGroupCount(),
+          "基线:归属表条目数 == 活组数(每页账本与全局归属表一致)");
+
+    // ── 核心:关掉内层规则 → Inner 失去自己的桶,但仍被 Outer 的成员名单"按名字收着"
+    hasInner = false;
+    P.install(root, spec, {});
+    const size_t ownerEntries2 = P.memoryBreakdown().groupOwner;
+    showOut("关掉内层规则后: childCount(Outer)=" + std::to_string(P.childCount(outer))
+            + " childCount(Inner)=" + std::to_string(P.childCount(inner))
+            + " 活组=" + std::to_string(P.liveGroupCount())
+            + " 归属表条目=" + std::to_string(ownerEntries2));
+    check(P.childCount(outer) == 1,
+          "★空壳必须退役:Outer 只剩 C 一个成员(Inner 被留下就是 FAIL)");
+    check(P.parentOf(a) == root && P.parentOf(b) == root,
+          "★Inner 的成员回落为直属(parentOf=数据父 root)");
+    check(ownerEntries2 == P.liveGroupCount(),
+          "★归属表条目数 == 活组数(空壳泄漏会打破这个等式 —— 修复前本行必红)");
+
+    // ── 收尾:走调用方该走的那条路(uninstall + 回收)→ 两个账本必须双双归零。
+    //   空壳会在这里留下 m_groupOwner 残留(它不在 page.groups 里,uninstall 遍历不到)
+    //   —— 这正是"泄漏检测的盲区":liveGroupCount() 答 0,而归属表还剩 1 条。
+    P.uninstall(root);
+    P.collectGarbage();
+    showOut("uninstall 后: 活组=" + std::to_string(P.liveGroupCount())
+            + " 归属表条目=" + std::to_string(P.memoryBreakdown().groupOwner));
+    check(P.liveGroupCount() == 0 && P.memoryBreakdown().groupOwner == 0,
+          "★uninstall 后:活组与归属表都归零(空壳会留下归属表残留 —— 修复前本行必红)");
+
+    P.unregisterRoot(root);
+    P.collectGarbage();
+    clearData(root);
+    delete root;
+}
+
 int main() {
     silenceCrtDialogs();
 #ifdef Q_OS_WIN
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    printf("NavTreeGroup unit_tests:23 块,每块打印 职责/输入/输出/校验\n");
+    printf("NavTreeGroup unit_tests:24 块,每块打印 职责/输入/输出/校验\n");
     t1_filter();  t2_bucket();  t3_collapse(); t4_reuse(); t5_flat(); t6_sort();
     t7_endToEnd(); t8_cache(); t9_rowOf(); t10_evaporate(); t11_multiLayer(); t12_deathOfOwner();
     t13_prune(); t14_rebind();
     t15_model(); t16_signals();
     t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_paranoidAndHeal();
-    t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup();
+    t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup(); t24_shellGroup();
     printf("\n══════ 汇总:%s(失败块数 = %d,即退出码)══════\n",
-           g_fail ? "有 FAIL" : "23 块全绿", g_fail);
+           g_fail ? "有 FAIL" : "24 块全绿", g_fail);
     printf("engine live groups at exit = %d\n", (int)P.liveGroupCount());
     return g_fail ? 1 : 0;
 }

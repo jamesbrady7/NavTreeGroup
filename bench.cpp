@@ -18,9 +18,12 @@
 //  政体:全部 BenchNode = m_children 连坐政体(最简;政体差异被虚接口吸收,
 //  对引擎侧计时没有影响 —— 引擎只消费 visibleChildrenCount/visibleChild)。
 #include <QElapsedTimer>
+#include <algorithm>  // std::sample(无放回抽样)
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>   // checkOk 的可变参数
+#include <iterator>   // std::back_inserter
+#include <random>
 #include <string>
 #include <vector>
 #include <map>
@@ -351,8 +354,15 @@ static void scenarioIncremental() {
     if (!requireBoundShapeA("incr")) return;   // ★ 增量删除的代价几乎全在账页重算上
     std::mt19937 rng(123);
     const int N = 1000;
+    // ★ 必须【无放回】抽样:被抽中的叶子下面要逐个 delete,而
+    //   `leaves[rng() % size]` 是有放回 —— 同一片叶子抽中两次 = 对已释放对象
+    //   调虚函数 + 二次 delete。⚠ seed 123 恰好 0 次重复,所以旧写法"看起来没事",
+    //   换随机 seed 约四成概率会撞(1000 抽自 100 万,生日问题的量级)。
+    //   std::sample 是无放回选择抽样,且保持 rng 可复现。
     std::vector<BenchNode*> victims;
-    for (int i = 0; i < N; ++i) victims.push_back(g_tree.leaves[rng() % g_tree.leaves.size()]);
+    victims.reserve(N);
+    std::sample(g_tree.leaves.begin(), g_tree.leaves.end(),
+                std::back_inserter(victims), N, rng);
     bench("delete-1k+revalidate", N, [&] {
         for (BenchNode* v : victims) {
             GuiBase* par = P.parentOf(v);          // 事前坐标(精准通道语义)

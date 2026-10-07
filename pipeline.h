@@ -121,6 +121,63 @@ inline bool shouldCollapse(const std::vector<Bucket>& buckets, size_t participan
         && buckets[0].members.size() == participants && participants == visCount;
 }
 
+// ── Stage B-2b:成员关系闭包(剔除"空壳组" + 丢掉随之变空的桶)──
+/**
+ * @brief 维持成员表的两条闭包性。不满足的一律是【空壳组】:
+ *        ① 桶里的【组】成员,它自己的 key 也必须是一个桶 —— 组的成员表只可能来自
+ *           "本轮有桶用它的 key",所以不在 key 集合里的组必然零成员(childCount 恒 0);
+ *        ② 每个桶必须非空 —— 否则视图上就是一个空组行。
+ *
+ *        成因都是【规则输出自相矛盾】:"没有任何节点再属于 A" 与 "A 属于 B" 同时成立。
+ *        多层的典型触发:内层组的登记被删/改名/成员被过滤(→ A 失去自己的桶),
+ *        而外层组的成员名单里还写着 A 的名字(→ 规则仍对 A 这个节点出外层票)。
+ *
+ *        ★ 不收敛的代价不只是"多一个空行":空壳组不被任何 page.groups 收录,
+ *          于是 dropProjection/uninstall 遍历不到它、liveGroupCount() 也数不到它
+ *          ⇒ **静默泄漏,连"退出时活组 = 0"这条断言都抓不到**。
+ *          (它只在全局 m_groupOwner 里留一条,那是唯一还能观测到它的地方。)
+ *
+ *        迭代到不动点:删掉壳会让收养它的桶变空,那条桶要一起丢,
+ *        于是"只养着一个壳"的外围组也会上榜 —— 轮数 = 嵌套深度,通常 1~2 轮。
+ * @param [in/out] buckets 就地收敛(桶成员被删、空桶被丢)
+ * @return size_t 被剔除的空壳组个数(0 = 成员关系本来就是闭合的)
+ */
+inline size_t closeMembership(std::vector<Bucket>& buckets) {
+    size_t droppedShells = 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        // ① 本轮"有自己的桶"的 key 集合 —— 也就是"有成员表"的那些组
+        std::set<std::string> keysWithBucket;
+        for (const Bucket& bucket : buckets) {
+            keysWithBucket.insert(bucket.ticket.key);
+        }
+        for (Bucket& bucket : buckets) {
+            std::vector<GuiBase*>& memberList = bucket.members;
+            const size_t sizeBefore = memberList.size();
+            memberList.erase(std::remove_if(memberList.begin(), memberList.end(),
+                [&keysWithBucket](GuiBase* member) {
+                    auto* memberGroup = dynamic_cast<TreeGroup*>(member);
+                    return memberGroup && !keysWithBucket.count(memberGroup->ticket().key);
+                }), memberList.end());
+            if (memberList.size() != sizeBefore) {
+                droppedShells += sizeBefore - memberList.size();
+                changed = true;
+            }
+        }
+        // ② 顺手丢掉变空的桶 —— 它的代表组已经没有任何成员,自己也是个壳
+        for (auto bucketIt = buckets.begin(); bucketIt != buckets.end(); ) {
+            if (bucketIt->members.empty()) {
+                bucketIt = buckets.erase(bucketIt);
+                changed = true;
+            } else {
+                ++bucketIt;
+            }
+        }
+    }
+    return droppedShells;
+}
+
 // ── Stage B-3:组复用匹配(纯匹配,不做任何所有权操作)──
 /**
  * @brief 按 key 把旧组匹配给新桶 —— 同 key 复用旧 TreeGroup 指针

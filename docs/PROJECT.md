@@ -15,10 +15,12 @@
 > `[实测]` = 跑过命令/探针,有输出证据 · `[读码]` = 只做过源码审读,未独立运行验证
 > · `[论证]` = 只有推理,无实证(必须写出"为什么暂时无法实证")
 >
-> 最后更新:**v4 重构(2026-10-07,perf-round2 分支)** —— 脏通知契约取代惰性发现,
-> 删除纪元/位图/双位置索引整套加速机械;设计全文见 **docs/重构v4_脏通知.md**,
-> 性能/内存对比见 §3,契约变化见 C5(v4)/C8(作废)。
-> 此前:第三方评审(2026-10-06)修复 R1/R2/R3;实现方(第三轮)§5 缺口全关闭。
+> 最后更新:**空壳组修复 + 对接契约修正(2026-10-07,perf-round2 分支)** —— 新增不变量 #11
+> (成员表闭合 / `closeMembership` / T24)、C5 补"属性漂移无兜底"、§1.5 补异常窗口、
+> §1.1 补通知 API、§3 补 paranoid 首发纪律;并修掉三处 v4 遗留的文档漂移。
+> 此前:**v4 重构(2026-10-07)** 脏通知契约取代惰性发现,设计全文见 **docs/重构v4_脏通知.md**,
+> 性能/内存对比见 §3,契约变化见 C5(v4)/C8(作废);
+> 第三方评审(2026-10-06)修复 R1/R2/R3;实现方(第三轮)§5 缺口全关闭。
 > 改动请在此追加一行"变更记录"。
 
 ---
@@ -119,6 +121,7 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 | `install` / `apply` / `refresh` / `uninstall` / `ungroup` | 写侧 | 是 | **是(立即 delete)** | **必须在 reset 括号内**(或视图未创建/已销毁) |
 | `discard(dying)` | 写侧 | 是 | **是(立即 delete)** | 必须在 `delete dying` **之前**调 |
 | `prune()` | 写侧 | 是(清僵尸) | **是(立即 delete)** | 必须在 reset 括号内 |
+| `invalidate(p)` / `invalidateNode(n)` / `notifyRemove(p,d)` / `invalidateAll()` | **通知(v4 新增)** | 否(只 O(1) 置脏,不重算) | 否 | `notifyRemove` 必须在 `delete dying` **之前**调;其余无 |
 | `bindSpec` / `unbindSpec` / `rebind` | 写侧 | 是 | `rebind` 间接 | 必须在 reset 括号内 |
 | `collectGarbage()` | **回收** | 否 | **是(唯一安全释放点)** | **必须在 begin/end(reset 或 removeRows)之内** |
 
@@ -170,6 +173,14 @@ v4 的缓存检查只有一行:`revalidate` 开头 `if (p.valid && !p.dirty) ret
   ② paranoid 漏报检测(默认 Debug 开,`setParanoidChecks`):childCount 对干净页额外比对,
   漂移 → stderr 点名漏报 owner + 当场自愈(只对【干净】页比对,已通知的脏页不誤报);
   ③ `structRev()` 精准操作前后取值比对(C9 不变)。
+- **⚠⚠ 属性漂移【没有任何兜底】(集成方必读,2026-10-07 读码核实)。**
+  三层兜底比的**全部是"孩子列表"**(`healIfDrift` 拿 `rawChildren` 快照逐项比指针),而属性变更
+  (材质/名字等一切影响 `filter`/`grouping`/`less` 的值)**不改变孩子列表** ⇒ 三层一层都发现不了:
+  `healIfDrift` 判不出漂移、`prune` 走同一个函数也判不出、`revalidate` 因页干净直接返回。
+  漏调 `invalidateNode` 的后果是**永久陈旧**(直到某次 `install`/`rebind`/reset 才被动修正),
+  而且**不崩不报**。所以 `invalidateNode` 是**没有保险的硬契约**,
+  与 `invalidate(parent)`(有 `healIfDrift` + paranoid 双兜底)**不是一个安全等级** —— 别并列看待。
+  (要给它上保险的唯一办法:让规则产出"属性指纹"一起存进 `lastLive`,代价是每页多存一份字符串。)
 - **单线程前提不变**(与 QAbstractItemModel 同级):引擎无锁;跨线程改数据树 = 调用方违约。
   ~~逃生阀 setEpochOptimization(false)~~ 随纪元机制删除 —— v4 没有"可关掉的优化",
   只有"必须遵守的通知契约"。回归:**T20(v4)** paranoid+prune 双自愈;**T22(v4)** 通知即新鲜。
@@ -284,9 +295,16 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 ### 1.5 异常安全
 
-`valid` / `checkedAt` 在**流水线全部跑完之后**才置位(`revalidate` 末尾的"宣布有效"段),此前任何
-用户回调(`filter`/`grouping`/`less`)抛异常都会让本页停在 `valid=false` → 下次重查自动收敛。`[读码]`
+`valid` 在**流水线全部跑完之后**才置位(`revalidate` 末尾的"宣布有效"段),此前任何
+用户回调(`filter`/`grouping`/`less`)抛异常都会让本页停在 `valid=false` + `dirty=true` → 下次重查自动收敛。`[读码]`
 - 注意:`lastLive` 是在流水线**之前** swap 的,所以抛异常后本页会重跑整条流水线(这是期望行为)。
+- ⚠ **异常会留下一个"半新半旧"的页(2026-10-07 读码发现,未修)**:`page.members` 在流水线中段
+  就 `std::move` 换新,而 `page.groups` 要到末尾才更新,中间还夹着 `sortMembers`/`sortFlat`
+  两次调用用户 `less`。`less` 若抛异常 ⇒ 这一页停在"members 是新的、groups 是旧的";
+  下一轮 `oldGroups = page.groups ∪ members 键` 就可能装进**两个 key 相同的组**
+  (aborted 那轮新建的 + 旧的),`matchReusable` 的 byKey 只能认领一个,另一个落 culled。
+  **这正是 `revalidate` 里 `groupsKeptAsMember` 白名单必须保留的原因**(它拦的就是这条路径上的 UAF,
+  而不是"多层分组的存活路径"—— 那个理由在 Stage B-2b 闭包落地后已不成立)。分级:低概率 + 需要用户 `less` 抛异常,故未修。
 
 ### 1.6 ★验证方法的边界:`QAbstractItemModelTester` 查不出"信号发错行" `[实测]`
 
@@ -325,7 +343,9 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
    `invalidate`/`notifyRemove`/`invalidateNode` 配对(delete 之前调);
    收口点模式见 interactive_demo 的 `createAndAttach`/`deleteChildRaw` 包装。
 6. **`m_retired` 的清理只在 `collectGarbage()`,且只在 begin/end 之内。**
-7. **`memberToGroup` 只存本层**(刻意无全局版,多层会互相覆盖)。
+7. ~~**`memberToGroup` 只存本层**(刻意无全局版,多层会互相覆盖)~~ **v4 作废**:该表已并入每页单表
+   `entries`,随页同生共死。**替代不变量**:"成员→坐标"只存在于每页的 `entries`,进程内**没有全局副本**
+   (全局反查表在多层下会互相覆盖),`parentOf` 靠沿自然父亲逐层下钻,天然 deepest-wins。
 8. **投影引擎是进程级单例**(`TreeProjection::instance()`),多文档共享一套 keyspace;
    跨根定位必须靠谓词自限定(如 `topOf(n)==root`)。
 9. **测试中途 `return` 必须伴随显式 `check(false, …)`** `[实测]`。静默 return 会让后半段
@@ -334,6 +354,13 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
    绝不静默跑成一堆 0** `[实测]`。理由:`bench regroup`/`mem` 单跑时账本为空 → 读数全 0
    而 exit=0,看起来"通过" —— 与第 9 条同源,都是**把"没测到"伪装成"测过了"**。
    参考实现:`bench.cpp::requireBoundShapeA()`。
+11. **成员表必须闭合:`page.members` 每个 value 里出现的【组】,必须也是这张表的 key。**
+   `[实测]`(2026-10-07 落地)违反 = **空壳组**:视图上多一个零成员的空组行,而且更糟 ——
+   空壳只是 members 的 value、不是 key ⇒ 不在 `page.groups` 里 ⇒ `dropProjection`/`uninstall`
+   遍历不到它、`liveGroupCount()` 也数不到它 ⇒ **只在全局 `m_groupOwner` 里留一条静默泄漏**。
+   维持者:`Pipeline::closeMembership`(Stage B-2b,迭代到不动点:剔除"自己的 key 没有桶"的组
+   + 丢掉随之变空的桶;轮数 = 嵌套深度)。**判据/回归**:`memoryBreakdown().groupOwner == liveGroupCount()`
+   —— 空壳会打破这个等式,而 `liveGroupCount()` 单独看是盲的(`unit_tests` **T24**)。
 
 ---
 
@@ -428,6 +455,14 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
    **`~GuiBase` 的连坐析构仍是递归的** —— 深度 >3 万级时 `delete root` 本身会爆栈。
    这是冻结架构的属性,改引擎解决不了。
 4. **单线程约束 + 通知契约**:见 C5(v4)。数据变更必须配对通知;跨线程改数据树 = 违约(引擎无锁,与 QAbstractItemModel 同级假设)。
+   ⚠ 其中 **`invalidateNode`(属性变更)没有任何兜底** —— 见 C5 里那条警告,别按"兜底能救"来接。
+5. **内网首发把 `setParanoidChecks(true)` 打开(Release 也开)。** `[建议,待内网数据回填]`
+   v4 的失败模式是**静默陈旧**(漏通知 → 显示错树,不崩不报),而 paranoid 是
+   **Release 下唯一能发现漏通知的手段**(三层兜底里的 ① 只在卫生边界生效,③ 要调用方主动用)。
+   代价 = 每次 `rowCount` 在干净页上多一次枚举;而导航树的真实访问模式是"**每个父亲问一次**",
+   不是"同一页反复问",所以代价 ≈ **一次额外枚举/展开**,不是 O(k²)
+   (§3 表里 `rowcount-cache-hit` 的 6.3× 差距是"同一页反复问"的极端场景,不代表界面行为)。
+   计划:首发开着 → 稳定后按 stderr 点名出的"漏通知清单"逐处补通知 → 再关。
 
 ---
 
@@ -435,7 +470,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 | 目标 | 期望 | 实测(Release / Debug) |
 |---|---|---|
-| `unit_tests` | 退出码 = 失败块数 = 0 | **23 块全绿,双配置**(2026-10-06 评审轮:新增 T22 裸坐标新鲜度 / T23 m_nodePage 清理;T21 阈值改为分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
+| `unit_tests` | 退出码 = 失败块数 = 0 | **24 块全绿,双配置**(2026-10-07 新增 **T24 空壳组**:用"归属表条目数 == 活组数"这个恒等式抓出"活着却不归任何页管"的静默泄漏 —— 修复前该块 3 条 FAIL 作分辨力;此前 2026-10-06 评审轮新增 T22 裸坐标新鲜度 / T23 entries 随页清理;T21 阈值分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
 | `navtree_demo` | 退出码 0,不变量通过 | ✔ 通过 |
 | `gui_demo` | 退出码 0 | ✔ 模型不变量 13 项 + 终检 10 项 |
 | `tree_tabs --selftest` | `selftest PASS` | ✔ |
@@ -603,3 +638,4 @@ gcstress-x200  200 轮(含 prune 剪枝路径 100 轮) | 残留待回收累计=0
 | **2026-10-07(用户现场 bug:解除一个工厂组,整页组全灭)** | 诊断:**非引擎、非 Qt 视图** —— demo 层语义缺口。压力树"大平铺件"的 10 个材料组由 installRuleWalk 的工厂规则安装,不在 g_manual 登记;右键"删除组"(onDeleteGroup)只认手动登记 → erase 空转 → installGrouping 见"空登记"→ **uninstall 整页** → 10 组陪葬。修复(demo 层):① `g_dissolved`(owner 名 → 已解散 key 集)—— **工厂组解散 = 规则层排除**(组是规则产物,引擎没有"删单个组"概念,生产同此);② `composeSpec(owner)` 唯一合成点 = 手动规则(优先,不豁免组)+ 工厂规则 + 排除表,顺手修掉两个连带暗坑(工厂页上手动建组顶掉工厂组、onRebuild 工厂页重建后工厂组丢失);③ installGrouping v2:只有"无手动且无工厂"才 uninstall;④ 排除表按【名字】记 → 跨单父重建不复活,整棵压力树重装(installStressProjection)时清零保电池确定性。**修复中抓到的新坑(留痕)**:installRuleWalk 全树共享 `stressRuleFor(树根)` —— 所有页的组 key 前缀是【根名】("压力装配体/Steel"),不是页名;composeSpec 第一版用 stressRuleFor(owner) 合成出"页名/Steel",与在装页的 key 对不上 → 排除永远查不中(实测 10→10)。★ 教训:**合成规则必须与实装规则逐字节同源,前缀这种"看起来是页内实现细节"的东西就是同一性本身**。回归:R 电池新增 3 断言(10→9 其余无损 / 成员回落直属 / 解散态跨单父重建存活+其余 9 组重生) | `[实测]` interactive --selftest 双配置 PASS(66 [OK])、--smoke、unit_tests、probe_review 全 exit 0;双配置 0 错误 0 警告 |
 | **2026-10-07(代码格式规范化:引擎六文件)** | 用户定三条规矩,引擎核心全部对齐:① **头文件函数注释统一 Doxygen**(`@brief/@param [in|out]/@return`,范本=revalidate/rawChildren 用户手改样式),覆盖 treeprojection.h / pipeline.h / ptrset.h / itreesource.h / navtreemodel.h 全部函数;② **所有 if/while/for 一律换行加大括号**(含单语句 return/continue,范本=revalidate 函数体),消灭"一行挤三条"的读码地雷;③ **无语义变量全部更名**:p→page、kv→pageEntry/memberEntry、pit→pageIt、oit→ownerIt、mit→membersIt、git→groupPageIt、eit→posIt、n→node、g→group、c→child、mem→memberList、b→binding、vis→visibleNodes、oldAll→oldGroups、culled→culledGroups、deleted→removedGroups、stale→stalePages 等(cpp 注释按用户要求原样保留,仅同步注释里引用的变量名)。范围=引擎六文件(treeprojection.h/.cpp、pipeline.h、ptrset.h、itreesource.h、navtreemodel.h);demo/tests/bench 未动。**纯格式与命名,零语义变化** | `[实测]` 双配置 clean build **0 错误 0 警告**;回归 12 项(Release:unit/nav/gui/tabs/inter/probe/bench + Debug:unit/inter/gui/tabs/nav)exit 全 0 |
 | **2026-10-07(用户现场 bug:删一个组,其它组展开状态全被重置为展开)** | 诊断:**非引擎、非 Qt 缺陷,是 demo 视图层两处行为叠加** —— ① `endResetModel` 的 Qt 语义就是"所有 index 失效、视图丢弃全部展开状态"(生产"更新→reset"通道同样会遇到);② 旧 `structuralReset` 随后**无条件 `expandAll()`**,把手动折叠过的组也强行拉开。引擎侧恰恰是为保状态设计过的:`matchReusable` 按 key 复用旧 TreeGroup 指针(同 key 组跨重算指针稳定)+ C1 延迟回收保证 reset 括号内旧指针内存有效 —— 展开状态**有得保**,只是没被消费。修复(视图层标准配方):reset 前模型遍历收集展开节点【指针集合】→ reset 后遍历活投影树,只对"活树 ∩ 之前展开"恢复 `setExpanded(true)`,新节点默认折叠;删除无条件 expandAll(仅保留 视图初次切换/手动"展开全部"按钮/onRebuild 三处刻意全展开语义)。已知良性瑕疵:退役组地址被新组复用时会多展开一次(纯外观);生产要零误认改用业务 key 做恢复键,套路相同 | `[实测]` interactive --selftest 双配置 PASS、--smoke 通过、0 错误 0 警告 |
+| **2026-10-07(空壳组修复 + 对接契约修正)** | ① **引擎修**:新增纯函数 `Pipeline::closeMembership`(Stage B-2b,迭代到不动点)—— 剔除"自己的 key 没有桶"的空壳组 + 丢掉随之变空的桶;`revalidate` 调用它,Debug 下 stderr 点名"规则输出自相矛盾"。起因:多层分组下"内层组失去全部成员,却仍被外层组按名字收着"→ 零成员空壳组。**真正的伤害不是多一个空行**:空壳只是 members 的 value、不是 key ⇒ 不在 `page.groups` ⇒ `dropProjection`/`uninstall`/`liveGroupCount()` 全部遍历不到它 ⇒ **静默泄漏**(实测 `uninstall` 后 `liveGroupCount()=0` 而归属表残留 1)。② **测试**:新增 **T24**(24 块),判据是恒等式 `memoryBreakdown().groupOwner == liveGroupCount()`;修复前 **3 条 FAIL**(实测"活组1/归属2""uninstall 后 0/1")⇒ 有分辨力;测试还当场抓出作者自己的场景 bug(漏给 C 出票)。③ **demo 根治**:`onDeleteGroup` 补"删除侧"引用清理 —— 把该组 label 从其它手动组成员名单里摘掉、并丢掉被摘空的登记(与 `doGroup` 建组时的"从其它组摘名字"对称;只做增侧清理 = 规则会输出自相矛盾的票)。④ **可读性**:`installGrouping` → **`syncPageRule`**(它实为"按当前登记把这一页重新投影一遍"),并补注释说明"删一个组为何走 `install` 而不是 `uninstall`"。⑤ **文档修正**:新增不变量 **#11**(成员表闭合)、C5 补"**属性漂移没有任何兜底**"警告(三层兜底比的都是孩子列表)、§1.5 补异常窗口(§516 换 members 而 §568 才换 groups,中间调用用户 `less`,抛异常即留下同 key 双胞胎 —— **这才是 `groupsKeptAsMember` 必须保留的真理由**,不是"多层存活路径")、§1.1 补通知 API 行、§3 补 paranoid 首发纪律、修掉三处 v4 遗留漂移(§1.5 checkedAt / §2#7 memberToGroup / §4 m_nodePage)。⑥ **bench 拆地雷**:`scenarioIncremental` 的 victims 由有放回抽样改 **`std::sample`**(无放回)—— 旧写法会对同一 leaf 二次 delete,`seed 123` 恰好 0 次重复掩盖了它,换随机 seed 约四成概率会撞。⑦ 同窗口另有两次 interactive 修复(工厂组解散只解散该组 `f624d5f`、结构变更跨 reset 保展开态 `e0a4fed`),详见各自提交 | `[实测]` 七目标 × 双配置 exit 全 0、**0 错误 0 警告**;`unit_tests` **24 块** × 双配置;`interactive --selftest` 66 [OK] PASS;bench 全模式(all/deep/dbg/gcstress/cold,prune/cold,mem/cold,regroup)× 双配置 `CHECK=0`;probe **0 confirmed**;Release bench **TOTAL 2288.9 ms / WS 326 MB / 账本 108.6 MB**(与 §3 基线一致,无回归);新诊断首轮全量回归中**仅在 T24 的设计场景命中一次**,其余 23 块 + 七 demo + bench 零噪声 |

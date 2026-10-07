@@ -223,8 +223,8 @@ static int g_keySeq = 0;
 
 // ═══════════════ 已解散组登记(工厂组"解除一个"的规则层答案)═══════════════
 // ★ 用户现场 bug(2026-10-07 修):右键"删除组"原来只认手动登记 —— 工厂组
-//   (如压力树 大平铺件 的 10 个材料组)不在登记里,erase 空转 → installGrouping
-//   见"空登记"→ uninstall 整页 → 一页 10 个组全部陪葬。
+//   (如压力树 大平铺件 的 10 个材料组)不在登记里,erase 空转 → 当时的 syncPageRule
+//   (旧名 installGrouping)见"空登记"→ uninstall 整页 → 一页 10 个组全部陪葬。
 //   正确语义:组是【规则的产物】,引擎没有"删单个组"的概念 ——
 //   手动组解散 = 删登记;工厂组解散 = 规则排除(key 进本表,规则出票前查表)。
 // ★ 按【owner 名字】做键(不用指针):工厂组的 key 自带 owner 名字前缀
@@ -250,9 +250,9 @@ static bool hasFactoryPage(GuiBase* owner) {
 }
 
 // 合成 owner 页的完整 Spec = 手动规则(优先) + 工厂规则 + 已解散排除。
-// ★ 唯一合成点 —— installGrouping / onRebuild(两种方式)全走这里,
+// ★ 唯一合成点 —— syncPageRule / onRebuild(两种方式)全走这里,
 //   同一页上手动组与工厂组【共存】,解除任何一个组都只影响它自己
-//   (旧实现 installGrouping 只装纯手动规则,还有两个连带暗坑:
+//   (旧名 installGrouping 的实现只装纯手动规则,还有两个连带暗坑:
 //    ① 工厂页上手动建组会把工厂组顶掉;② onRebuild 工厂页重建后工厂组丢失)。
 static ProjectionSpec composeSpec(GuiBase* owner) {
     std::vector<ManualGroup> groups = g_manual[owner];   // 按值捕获名字(不捕指针!)
@@ -285,8 +285,16 @@ static ProjectionSpec composeSpec(GuiBase* owner) {
     return ProjectionSpec{ nullptr, rule, demoLess, { false, true /*dynamicAll*/ } };
 }
 
-static void installGrouping(GuiBase* owner) {
-    // "既无手动登记、也无工厂规则"才拆整页(旧实现只看手动登记 → 工厂页被误杀)
+// ═══ 这一页投影的【唯一同步入口】(旧名 installGrouping)═══════════════
+// 名字说明:它不只是"装分组" —— 它是"按当前登记的规则意图,把这一页重新投影一遍"。
+//   · 引擎里【没有】"增删某一个组"这种操作:组是规则的产物,要动组只能动规则的输出
+//     (手动组 → 改 g_manual 登记;工厂组 → 改 g_dissolved 排除表),然后整体重算。
+//     所以"删一个组"也走这里 —— 这不是绕路,是 v4 明确否决"增量维护"后的唯一正路。
+//   · 分派:这一页还该不该有投影?不该 → uninstall(拆整页,退回透传);
+//     该 → install(composeSpec 重装)。⚠ 判据必须【两条都看】:
+//     "既无手动登记、也无工厂规则"才算没用 —— 旧实现只看手动登记,
+//     于是在有工厂规则的页上删掉唯一的手动组会误判 → uninstall 整页 → 10 个材料组陪葬。
+static void syncPageRule(GuiBase* owner) {
     if (g_manual[owner].empty() && !hasFactoryPage(owner)) { P.uninstall(owner); return; }
     P.install(owner, composeSpec(owner));
 }
@@ -402,7 +410,7 @@ static void structuralReset(const std::function<void()>& mutate) {
 // ═══════════════ 操作 4:删除组(解散,成员回落直属) ═══════════════
 // ★ 两条解散路径(用户现场 bug 的修复,2026-10-07):
 //   手动组 → 删登记(g_manual);工厂组 → key 进规则排除表(g_dissolved)。
-//   两者最后都走 installGrouping = composeSpec 重装【这一页】——
+//   两者最后都走 syncPageRule = composeSpec 重装【这一页】——
 //   其它组(手动+工厂)原样保留。旧实现只认手动登记,工厂组进来时
 //   空登记 → uninstall 整页 → 大平铺件 10 个材料组一起消失。
 static void onDeleteGroup(GuiBase* group) {
@@ -415,13 +423,29 @@ static void onDeleteGroup(GuiBase* group) {
         [&](const ManualGroup& m) { return m.key == key; });
     const bool wasManual = (it != v.end());
     v.erase(it, v.end());
+
+    // ★ 引用完整性(删除侧的对称清理,与 doGroup 建组时的"从其它组摘名字"配对):
+    //   手动组之间是【按名字】互相收的,所以删掉一个组之后,别的组的成员名单里
+    //   可能还留着它的【名字】。不摘的话规则会继续对这个节点出票 —— 而它已经失去了
+    //   自己的桶(登记没了)→ 被当成"沦为成员的旧组"保护下来 → 变成一个【没有成员的
+    //   空壳组】挂在收养者底下(引擎侧已由 Stage B-2b 的闭包兜住,但那是兜底,不是根治)。
+    //   ⚠ 名字是弱引用:同名的数据节点会被一并摘掉 —— 这是"按名字记身份"的固有代价。
+    for (auto& other : g_manual[owner]) {
+        other.memberNames.erase(
+            std::remove(other.memberNames.begin(), other.memberNames.end(), label),
+            other.memberNames.end());
+    }
+    // 名单被摘空的手动组也该消失(与 doGroup 里那一句对称)
+    g_manual[owner].erase(std::remove_if(g_manual[owner].begin(), g_manual[owner].end(),
+        [](const ManualGroup& m) { return m.memberNames.empty(); }), g_manual[owner].end());
+
     if (!wasManual) {
         g_dissolved[baseName(owner)].insert(key);   // 工厂组:规则层排除(按 key 记,重建不复活)
         log("解散工厂组 [" + label + "] → 规则排除(按 key 记,重建不复活);其余组不受影响");
     } else {
         log("删除手动组 [" + label + "] → 成员回落为直属");
     }
-    structuralReset([&] { installGrouping(owner); });   // composeSpec 重装本页(手动+工厂+排除)
+    structuralReset([&] { syncPageRule(owner); });   // composeSpec 重装本页(手动+工厂+排除)
 }
 
 // ═══════════════ 删除内核:政体感知摘除 + 清后代 + 清账 ═══════════════
@@ -488,7 +512,7 @@ static bool doGroup(GuiBase* owner, std::vector<GuiBase*> nodes, const std::stri
         [](const ManualGroup& m) { return m.memberNames.empty(); }), g_manual[owner].end());
     g_manual[owner].push_back(mg);
     log("分组 " + std::to_string(nodes.size()) + " 个节点 → [" + mg.label + "](按名字记,跨重建稳定)");
-    structuralReset([&] { installGrouping(owner); });
+    structuralReset([&] { syncPageRule(owner); });
     return true;
 }
 static void onGroupSelected(std::vector<GuiBase*> nodes) {
@@ -724,7 +748,7 @@ static void installStressProjection() {
     }
     std::set<GuiBase*> seen;
     installRuleWalk(g_stressRoot, g_stressRoot, stressRuleFor(g_stressRoot), seen);
-    installGrouping(g_stressRoot);                   // 根页:手动组名单(与 A~Q 电池同机制)
+    syncPageRule(g_stressRoot);                   // 根页:手动组名单(与 A~Q 电池同机制)
     if (g_stressRoot2) {
         std::set<GuiBase*> seen2;
         installRuleWalk(g_stressRoot2, g_stressRoot2, stressRuleFor(g_stressRoot2), seen2);
@@ -901,7 +925,7 @@ static void stressApplyMaterial() {
             std::set<GuiBase*> seen;
             installRuleWalk(r, r, stressRuleFor(r), seen);
         }
-        installGrouping(g_stressRoot);   // 根页:保留"深链集合"手动组
+        syncPageRule(g_stressRoot);   // 根页:保留"深链集合"手动组
     });
     log("规则 → 按材料(逐页装;留意:同一材料名在不同页是【不同的组】——组是每页的产物)");
 }
@@ -1479,7 +1503,7 @@ static int runSelfTest() {
         // ── 手动组(根页)存在性 + 与子页材料规则共存 ──
         const size_t groupsAfterProj = P.liveGroupCount();
         TreeGroup* deepSet = findGroupByLabel(rs, "深链集合");
-        // ⚠ 不断言"成员数==2":根页由 installGrouping(手动名单)负责,而子页工厂规则
+        // ⚠ 不断言"成员数==2":根页由 syncPageRule(手动名单)负责,而子页工厂规则
         //   先装时会覆盖根页(把"深层节点"收进材料组),所以根页成员数取决于两套规则的
         //   先后。这是"同一页两套规则谁优先"的既有语义,不是 bug;这里只断言它确实存在。
         check(deepSet != nullptr && P.childCount(deepSet) >= 1,
@@ -1512,8 +1536,8 @@ static int runSelfTest() {
         }
 
         // ── ★工厂组解散(用户现场 bug 回归,2026-10-07)──
-        //   旧实现:右键"删除组"只认手动登记 → 工厂组空转 → installGrouping
-        //   见空登记 uninstall 整页 → 大平铺件 10 个材料组【全部】消失。
+        //   旧实现:右键"删除组"只认手动登记 → 工厂组空转 → syncPageRule 见空登记
+        //   → uninstall 整页 → 大平铺件 10 个材料组【全部】消失。
         //   新实现:工厂组解散 = 规则排除(g_dissolved 按 key),只死一个组。
         {
             GuiBase* ff = findByName(rs, "大平铺件");
@@ -1624,7 +1648,7 @@ int main(int argc, char** argv) {
     { ManualGroup seed; seed.key = "manual_seed"; seed.label = "钢件";
       seed.memberNames = { "Base", "BoltA" };
       g_manual[g_root].push_back(seed);
-      installGrouping(g_root); }
+      syncPageRule(g_root); }
 
     int rc;
     {   // ── 窗口作用域:view/model/log 先于数据析构(teardown 不再查询死树)──

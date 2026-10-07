@@ -403,6 +403,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
                     }
                 }
             }
+            /** 如果是非原始数据（分组节点），走以下逻辑 **/
             auto membersIt = page.members.find(static_cast<TreeGroup*>(candidate));
             if (membersIt == page.members.end()) {
                 return SIZE_MAX;
@@ -449,6 +450,18 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
         buckets.clear();
     }
 
+    // Stage B-2b:成员关系闭包 —— 剔除"自己的 key 没有桶"的空壳组(纯函数,见 pipeline.h)。
+    // 不收敛的后果不只是视图多一个空组行:空壳不在 page.groups 里 → 本函数的淘汰分支
+    // 遍历不到它、liveGroupCount() 也数不到它 → 只在 m_groupOwner 里留一条静默泄漏。
+    if (size_t shellCount = Pipeline::closeMembership(buckets); shellCount != 0) {
+#ifdef _DEBUG
+        fprintf(stderr,
+                "[TreeProjection] 规则输出自相矛盾:丢弃了 %zu 个空壳组"
+                "(自己已无成员,却被别的组按名字收着)—— 请检查分组规则/手工登记表。\n",
+                shellCount);
+#endif
+    }
+
     // Stage B-3:复用匹配(纯函数),然后引擎做所有权动作:
     // 复用旧组(指针稳定 → QModelIndex/展开/选中状态跨重算存活)或新建;
     // 未复用的旧组淘汰(★级联拆其内层投影 + 延迟回收,读侧触发绝不 delete —— 契约 C1)
@@ -463,7 +476,14 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
         newMembers[bucketGroup] = buckets[bucketIdx].members;
         m_groupOwner[bucketGroup] = parent;
     }
-    // ★ 沦为"成员"的旧组不能淘汰 —— 它活在外层组里面(多层分组的存活路径)。
+    // ★ 沦为"成员"的旧组【绝不能】直接淘汰:它的指针已经写进 newMembers[收养者] 的成员表,
+    //   而模型会顺着 child(收养者, i) 读到它 —— 回收它 = 让另一条账本持有已释放指针(UAF)。
+    //   ⚠ Stage B-2b 的闭包成立后,这个交集【理论上为空】(桶里的组必有桶 ⇒ 必被 matchReusable
+    //     认领 ⇒ 不在 culledGroups)。保留下来的唯一理由是那条"同 key 重复旧组"的病态路径:
+    //     matchReusable 的 byKey 后者覆盖前者,落选的那个会被报成 culled ——
+    //     此时这道白名单把"空壳"降级为"安全但无用地活着",而不是 UAF。
+    //     代价:白名单为了不 UAF 必须让它继续存在于成员表里 —— 也就是保留一个空组行。
+    //     (若哪天能证明同页 key 唯一,这段可以删除,那时 closeMembership 就是完整答案。)
     //   仅在有淘汰候选时才全扫成员(dynamic_cast 不便宜,稳态 culledGroups 为空 → 整遍跳过)
     std::set<TreeGroup*> groupsKeptAsMember;
     if (!culledGroups.empty()) {
