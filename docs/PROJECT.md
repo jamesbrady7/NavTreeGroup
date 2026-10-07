@@ -33,6 +33,7 @@
 | 项 | 值 |
 |---|---|
 | 目标 | 把数据侧三政体原始树,"惰性投影"成带分组/过滤/排序的展示树 |
+| **接入手册(给内网)** | **docs/部署手册.md** —— 场景化代码(最小接线 / 全量重建 / 释放全部孩子 / 精准删除 / 属性变更 / 换规则 / 过滤搜索 / 多根),每段都配"该调什么·不该调什么·为什么";片段由 `tools/manual_snippets_check.cpp` 做 API 检查,接口改名即编不过 |
 | 语言/工具链 | C++17 · MSVC(VS2019, 14.29) · Qt 5.15.2 msvc2019_64 · CMake ≥3.16 VS 生成器 |
 | 源码规模 | 非 build 文件 28 个;引擎核心 4 个文件(treeprojection.h/.cpp、projection_stages.h、ptrset.h) |
 | 构建产物 | 7 个可执行:`navtree_demo` `gui_demo` `tree_tabs` `unit_tests` `interactive_demo` `bench` `probe_review`(评审探针) |
