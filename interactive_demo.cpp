@@ -345,11 +345,57 @@ static QString displayName(GuiBase* n) {
 }
 
 // 结构性变更(增/分组/删组/重建)统一走 reset 通道 —— 对应你们"更新→reset"的生产机制
+// ★ 跨 reset 保持展开状态(用户现场 bug 修复,2026-10-07):
+//   病灶不在引擎 —— endResetModel 是 Qt 语义:所有 index 失效,QTreeView 丢弃
+//   全部展开状态;旧实现随后又无条件 expandAll(),于是"每删一个组,
+//   用户手动折叠过的组全被强行拉开"。
+//   标准配方:reset 前按【指针】收展开集合 → reset 后遍历活的投影树,
+//   只恢复"之前展开且现在还活着"的节点,新节点保持默认折叠。
+//   ★ 指针之所以可当恢复键,是引擎在配合:matchReusable 按 key 复用旧组,
+//     同 key 组跨重算指针稳定(C1 延迟回收也保证 reset 括号内旧指针内存有效)。
+//   ⚠ 指针集合有个良性瑕疵:已退役组的地址可能被新组复用 → 新组会被误当
+//     "之前展开过"而多展开一次(纯外观,不影响坐标/结构);生产要零误认,
+//     把恢复键换成业务 key(如 组ticket.key+owner 路径)即可,套路相同。
+//   成本:每次结构变更 O(投影树) 两次遍历 —— demo 规模毫秒级;生产若树大,
+//     可只收/恢复"变更页所在分支"(reset 前后都拿得到 owner)。
 static void structuralReset(const std::function<void()>& mutate) {
+    // ① reset 前:收集当前展开的节点指针(模型遍历 + 视图展开位)
+    std::set<GuiBase*> expandedBefore;
+    std::function<void(const QModelIndex&)> collectExpanded = [&](const QModelIndex& parentIdx) {
+        const int rows = g_model->rowCount(parentIdx);
+        for (int row = 0; row < rows; ++row) {
+            QModelIndex childIdx = g_model->index(row, 0, parentIdx);
+            if (!childIdx.isValid()) {
+                continue;
+            }
+            if (g_view->isExpanded(childIdx)) {
+                expandedBefore.insert(g_model->nodeOf(childIdx));
+            }
+            collectExpanded(childIdx);
+        }
+    };
+    collectExpanded(QModelIndex());
+
     g_model->beginFullReset();
     mutate();
-    g_model->endFullReset();
-    g_view->expandAll();
+    g_model->endFullReset();      // 内部自动 collectGarbage:退役组已在此刻释放
+
+    // ② reset 后:遍历【活的】投影树恢复展开位 —— 用"活树 ∩ 之前展开"求交,
+    //    全程只 deref 活指针,旧集合里的死指针自然落空(绝不解引用)
+    std::function<void(const QModelIndex&)> restoreExpanded = [&](const QModelIndex& parentIdx) {
+        const int rows = g_model->rowCount(parentIdx);
+        for (int row = 0; row < rows; ++row) {
+            QModelIndex childIdx = g_model->index(row, 0, parentIdx);
+            if (!childIdx.isValid()) {
+                continue;
+            }
+            if (expandedBefore.count(g_model->nodeOf(childIdx))) {
+                g_view->setExpanded(childIdx, true);
+            }
+            restoreExpanded(childIdx);
+        }
+    };
+    restoreExpanded(QModelIndex());
     refreshStressUI();
 }
 
