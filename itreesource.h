@@ -15,11 +15,41 @@ class ITreeSource {
 public:
     virtual ~ITreeSource() = default;
 
-    virtual size_t   childCount(GuiBase* node) = 0;   // 投影后的孩子数(含组节点)
-    virtual GuiBase* child(GuiBase* node, size_t i) = 0;   // 投影序列第 i 个
-    virtual GuiBase* parentOf(GuiBase* node) = 0;     // 投影父亲(可能是组;逐层下钻 deepest-wins)
-    virtual int      rowOf(GuiBase* node) = 0;        // 在投影父亲序列中的行号;-1=不在投影树上(被过滤/已死)
-    virtual bool     isGroup(GuiBase* node) const = 0;
+    /**
+     * @brief 投影后的孩子数(含组节点);唯一缓存校验点
+     * @param [in] node 被查询节点
+     * @return size_t 孩子数
+     */
+    virtual size_t childCount(GuiBase* node) = 0;
+
+    /**
+     * @brief 投影序列第 i 个孩子(约定先 childCount 校验再 child 读缓存)
+     * @param [in] node 被查询节点
+     * @param [in] i 投影序列下标
+     * @return GuiBase* 第 i 个;越界返回 nullptr
+     */
+    virtual GuiBase* child(GuiBase* node, size_t i) = 0;
+
+    /**
+     * @brief 投影父亲(可能是组;逐层下钻 deepest-wins)
+     * @param [in] node 被定位节点
+     * @return GuiBase* 投影父亲
+     */
+    virtual GuiBase* parentOf(GuiBase* node) = 0;
+
+    /**
+     * @brief 在投影父亲序列中的行号
+     * @param [in] node 被定位节点
+     * @return int 行号;-1 = 不在投影树上(被过滤/已死)
+     */
+    virtual int rowOf(GuiBase* node) = 0;
+
+    /**
+     * @brief 判断节点是否为展示组(TreeGroup)
+     * @param [in] node 待判断节点
+     * @return bool true = 组节点
+     */
+    virtual bool isGroup(GuiBase* node) const = 0;
 
     // ── 生命周期回收(不是"业务写侧刀把")──────────────────────
     // collectGarbage():释放引擎已淘汰、但可能仍被视图以
@@ -29,6 +59,9 @@ public:
     //   ★ 调用契约:必须在 begin/endResetModel 或 begin/endRemoveRows 之内。
     //     NavTreeModel 的 endFullReset / endRowRemoval 已自动调用,
     //     所以走这两条通道的调用方零心智负担。
+    /**
+     * @brief 释放引擎已淘汰、延迟待回收的展示节点(唯一安全释放点,契约 C3)
+     */
     virtual void collectGarbage() = 0;
 
     // ── 结构版本号:用于【检测视图与引擎是否失步】──────────────
@@ -37,5 +70,9 @@ public:
     //   这不是 bug,是"惰性"的定义;但模型不会因此收到任何信号,
     //   所以调用方需要一个手段判断"我这次操作前后结构被动过了没有"。
     //   典型用法:精准操作前后各取一次,不等就说明该走 reset 通道了。
-    virtual size_t   structRev() const = 0;
+    /**
+     * @brief 投影树形状版本号(组增删/行数变化时递增;内容替换不递增)
+     * @return size_t 单调递增计数
+     */
+    virtual size_t structRev() const = 0;
 };

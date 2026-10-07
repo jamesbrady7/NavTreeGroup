@@ -12,7 +12,7 @@
 //    v4 改为【通知失效】:调用方在数据变更后调一次 invalidate(O(1) 置脏),
 //    读侧只查脏标志 —— 干净=直接答缓存(零枚举),脏=重算一次。
 //      · 跨调用 O(k²) 根除(v3 文档承认只有数据侧信号这一条路能治);
-//      · 缓存检查从三十行机械塌缩成一行 `if (p.valid && !p.dirty) return;`;
+//      · 缓存检查从三十行机械塌缩成一行 `if (page.valid && !page.dirty) return;`;
 //      · 代价:漏通知=投影陈旧,由三层兜底收敛(见下"漏通知兜底")。
 //
 //  设计根基(与 v2/v3 一致):
@@ -107,51 +107,142 @@ struct PosEntry {
 // ── 投影引擎 ──────────────────────────────────────────
 class TreeProjection : public ITreeSource {
 public:
+    /**
+     * @brief 取得引擎单例(进程级唯一账本)
+     * @return TreeProjection& 全局唯一实例
+     */
     static TreeProjection& instance();
-    ~TreeProjection();   // 释放全部 TreeGroup(引擎是组的唯一所有者)
+
+    /**
+     * @brief 析构:释放全部 TreeGroup 并兜底清空待回收队列(引擎是组的唯一所有者)
+     */
+    ~TreeProjection();
 
     using Options = GroupingOptions;   // 兼容旧名
 
     // ══ 写侧 API ══
+    /**
+     * @brief 给 parent 安装完整投影(过滤+分组+排序一次声明);入口自带 prune 自愈
+     * @param [in] parent 被投影的父节点(其孩子按 Spec 加工)
+     * @param [in] spec 投影规格(filter/grouping/less/opt,均可空)
+     * @param [in] siblings 分组静态参与名单(仅 opt.dynamicAll=false 时生效;允许"脏",内部消毒)
+     * @return vector<TreeGroup*> 本页当前生效的组列表(引擎持有,调用方不得 delete)
+     */
     std::vector<TreeGroup*> install(GuiBase* parent, const ProjectionSpec& spec,
                                     std::vector<GuiBase*> siblings = {});
+
+    /**
+     * @brief 兼容旧接口:只装分组(等价 install 一个只有 grouping 槽的 Spec)
+     * @param [in] parent 被分组的父节点
+     * @param [in] siblings 分组静态参与名单
+     * @param [in] rule 分组规则(节点 → 可选票据)
+     * @param [in] opt 分组选项(塌缩/动态全员)
+     * @return vector<TreeGroup*> 本页当前生效的组列表
+     */
     std::vector<TreeGroup*> apply(GuiBase* parent, const std::vector<GuiBase*>& siblings,
                                   GroupRule rule, Options opt = {});
+
     // ── 写侧三个"立即释放组"的入口(前提:调用方已保证视图坐标失效,即在 reset 括号内)──
     //   uninstall/discard/prune 走 dropProjection(...,deferDelete=false)= 当场 delete。
     //   ⚠ 读侧与 revalidate 淘汰分支【绝不】走这里(它们 deferDelete=true,见 collectGarbage 契约)。
+    /**
+     * @brief 拆掉 parent 的整个投影(组【立即】删除,恢复透传)
+     * @param [in] parent 装过投影的父节点;无页时幂等无操作
+     */
     void uninstall(GuiBase* parent);
-    void ungroup(GuiBase* parent) { uninstall(parent); }
-    void refresh(GuiBase* parent);     // = invalidate(parent) + 立即重算(幂等收敛)
+    void ungroup(GuiBase* parent) { uninstall(parent); }   // 旧名兼容
+
+    /**
+     * @brief 数据变化后按已装 Spec 强制重算(= prune + 置脏 + 立即 revalidate,幂等收敛)
+     * @param [in] parent 装过投影的父节点;无页时只剩 prune 的自愈效果
+     */
+    void refresh(GuiBase* parent);
+
+    /**
+     * @brief 查询 parent 是否装有投影页
+     * @param [in] parent 待查询节点(允许死指针:只做 map key 值比较)
+     * @return bool true = 账本里有这一页
+     */
     bool hasProjection(GuiBase* parent) const;
+
+    /**
+     * @brief 全引擎存活组数(泄漏自检用)
+     * @return size_t 所有账页 groups 列表的大小之和
+     */
     size_t liveGroupCount() const;
 
     // ══ ★数据侧变更通知(v4 使用侧的唯一新义务)══════════════════
     //   契约:动完数据就调一次(幂等、O(1) 置脏、可在批量操作末尾统一调)。
     //   通知只置脏标志,不触发重算 —— 重算发生在下次读(批量变更天然合并)。
     //   漏通知不会崩,只会投影陈旧,并由 prune/paranoid 三层兜底收敛(见文件头)。
-    void invalidate(GuiBase* parent);       // parent 的孩子列表变了(增/删/移动/重排序)
-    void invalidateNode(GuiBase* node);     // node 自身属性变了(材质/名字等影响 filter/grouping/less 的值)
+    /**
+     * @brief 通知"parent 的孩子列表变了"(增/删/移动/重排序)
+     * @param [in] parent 数据发生变更的父节点;无投影页时幂等无操作
+     */
+    void invalidate(GuiBase* parent);
+
+    /**
+     * @brief 通知"node 自身属性变了"(材质/名字等影响 filter/grouping/less 取值)
+     * @param [in] node 属性变更的节点(置脏的是它【投影父亲】所在的页)
+     */
+    void invalidateNode(GuiBase* node);
+
+    /**
+     * @brief 删除节点的便捷组合通知 = invalidate(parent) + discard(dying)
+     * @param [in] parent dying 的数据侧父亲(孩子列表将变)
+     * @param [in] dying 即将被 delete 的节点。★必须在 delete dying【之前】调;
+     *            级联删整棵子树时只对子树根调一次即可(内部页变僵尸,prune 清)
+     */
     void notifyRemove(GuiBase* parent, GuiBase* dying);
-        // 便捷组合 = invalidate(parent) + discard(dying)。必须在 delete dying【之前】调。
-        // 级联删整棵子树:只对子树根调一次即可(内部页变僵尸,prune 清)。
-    void invalidateAll();                   // 全部账页置脏(大变更后不想逐个报;下次读逐页收敛)
+
+    /**
+     * @brief 全部账页置脏(大变更后不想逐个报;下次读逐页收敛)
+     */
+    void invalidateAll();
 
     // ══ 组回收:读侧绝不 delete,只有这里才真正释放(契约 C1)══════
     //   淘汰的组只进 m_retired(账本已摘除、内存仍有效),由 collectGarbage() 在
     //   【视图 persistent index 全部失效之后】(= begin/endReset 或 begin/endRemoveRows 之内)真正 delete。
     //   NavTreeModel 的 endFullReset/endRowRemoval 已自动调用 → 走这两条通道的调用方零心智负担。
-    void   collectGarbage() override;
+    /**
+     * @brief 真正释放已淘汰的组(全工程唯一安全释放点;契约 C3)
+     *        必须在 begin/end(reset 或 removeRows)括号内调用 ——
+     *        此刻 Qt 已令相关 persistent index 失效
+     */
+    void collectGarbage() override;
+
+    /**
+     * @brief 待回收组数(m_retired 当前深度;长期不清会堆积,用它自检)
+     * @return size_t 已淘汰但尚未 delete 的组数
+     */
     size_t retiredCount() const { return m_retired.size(); }
-    bool   hasRetired() const { return !m_retired.empty(); }
+
+    /**
+     * @brief 是否有待回收的组
+     * @return bool m_retired 非空
+     */
+    bool hasRetired() const { return !m_retired.empty(); }
 
     // ── 结构版本号(契约 C9 失步自检;递增条件:组增删 或 flat 行数变)──
+    /**
+     * @brief 投影树【形状】版本号(精准操作前后各取一次,不等 = 结构被动过)
+     * @return size_t 单调递增计数
+     */
     size_t structRev() const override { return m_structRev; }
 
     // ── paranoid 漏报检测(默认 _DEBUG 开、Release 关)──────────────
     //   开:childCount 对干净页额外做"枚举 vs lastLive"比对,漂移即 stderr 点名 + 自愈。
     //   不是性能开关,是【开发期抓漏通知】的工具;Release 关掉省那一次枚举。
+    /**
+     * @brief 开/关漏报检测(开:childCount 对干净页额外比对,漂移即点名+自愈)
+     * @param [in] on true=开启(默认 _DEBUG 开、Release 关)
+     */
     void setParanoidChecks(bool on) { m_paranoid = on; }
+
+    /**
+     * @brief 查询漏报检测开关状态
+     * @return bool 当前是否开启
+     */
     bool paranoidChecks() const { return m_paranoid; }
 
     // ══ 账本内存分解(纯观测)══════════════════════════════════
@@ -161,9 +252,9 @@ public:
         size_t poolNodes = 0;
         size_t lastLivePtr = 0;    // lastLive 缓存快照指针总数(自愈比对用)
         size_t flatPtr = 0;
-        size_t memberGroups = 0;   // p.members 的组条目数
-        size_t memberPtr = 0;      // p.members 里成员指针总数
-        size_t entries = 0;        // ★ p.entries 条目总数(= flat ∪ 各组成员,单一位置表)
+        size_t memberGroups = 0;   // page.members 的组条目数
+        size_t memberPtr = 0;      // page.members 里成员指针总数
+        size_t entries = 0;        // ★ page.entries 条目总数(= flat ∪ 各组成员,单一位置表)
         size_t groupsVec = 0;
         size_t groupOwner = 0;
         size_t pageObjBytes = 0;
@@ -185,38 +276,122 @@ public:
         size_t retiredBytes = 0;
         size_t totalWithRetired() const { return totalBytes() + retiredBytes; }
     };
+
+    /**
+     * @brief 账本内存分解(只读遍历,不改任何状态;内网做内存预算用它,别靠估)
+     * @return MemBreakdown 条目数 + 字节估算(口径见实现注释)
+     */
     MemBreakdown memoryBreakdown() const;
+
+    /**
+     * @brief m_retired 的历史峰值(只增不减;峰值出现在换规则那一瞬,事后采样采不到)
+     * @return size_t 待回收队列曾经达到的最大深度
+     */
     size_t retiredHighWater() const { return m_retiredHighWater; }
-    void   resetRetiredHighWater() { m_retiredHighWater = m_retired.size(); }
-    // 组入队待回收 + 更新峰值水位。**所有 m_retired 写入必须走它**(直接 push_back 会漏记高水位)。
-    void noteRetired(TreeGroup* g) {
-        m_retired.push_back(g);
-        if (m_retired.size() > m_retiredHighWater) m_retiredHighWater = m_retired.size();
+
+    /**
+     * @brief 重置峰值计数(基准测试用:换一个场景前调一下,免得读到上一场景的值)
+     */
+    void resetRetiredHighWater() { m_retiredHighWater = m_retired.size(); }
+
+    /**
+     * @brief 组入队待回收 + 更新峰值水位。★所有 m_retired 写入必须走它
+     *        (直接 push_back 会漏记高水位 → 内存基准失真)
+     * @param [in] group 已从账本摘除、等待安全点释放的组
+     */
+    void noteRetired(TreeGroup* group) {
+        m_retired.push_back(group);
+        if (m_retired.size() > m_retiredHighWater) {
+            m_retiredHighWater = m_retired.size();
+        }
     }
 
     // ══ 生命周期卫生(三政体生存法则)══
-    void discard(GuiBase* dying);      // 腿①:显式讣告(delete 前调;纯 map 操作,不 deref 死者)
+    /**
+     * @brief 腿①显式讣告:节点死前清掉它的账页(纯 map 操作,全程不解引用 dying)
+     * @param [in] dying 即将 delete 的节点(可能正在析构栈上,虚表已退化 → 只当 key 用)
+     */
+    void discard(GuiBase* dying);
+
+    /**
+     * @brief 注册树根(prune/rebind 的 DFS 起点;重复注册幂等)
+     * @param [in] root 树根节点(nullptr 忽略)
+     */
     void registerRoot(GuiBase* root);
+
+    /**
+     * @brief 注销树根
+     * @param [in] root 之前注册过的树根
+     */
     void unregisterRoot(GuiBase* root);
-    void prune();                      // 腿②:可达性剪枝 + 漏通知自愈(僵尸投影清除+孤儿组释放)
+
+    /**
+     * @brief 腿②可达性剪枝 + 漏通知自愈:从注册根沿活枚举 DFS,
+     *        走不到的账页 key = 死者 → 清条目 + 删孤儿组;沿途对每页做漂移检测
+     */
+    void prune();
 
     // ══ 腿③:声明式 Spec 绑定(跨全量重建重生)══
     struct SpecBinding {
-        std::string id;
-        std::function<bool(GuiBase*)> locate;
+        std::string id;                        // 绑定名(幂等去重/解绑)
+        std::function<bool(GuiBase*)> locate;  // 定位谓词:命中谁就给谁装 Spec
         ProjectionSpec spec;
     };
-    void bindSpec(SpecBinding b);
+
+    /**
+     * @brief 注册声明式绑定并立即生效(同 id 覆盖;内部执行 rebind)
+     * @param [in] binding id + 定位谓词 + Spec(locate 为空则忽略)
+     */
+    void bindSpec(SpecBinding binding);
+
+    /**
+     * @brief 解绑(已装投影保留现场;下次重建后不再重生。要立即拆用 uninstall)
+     * @param [in] id 绑定名
+     */
     void unbindSpec(const std::string& id);
-    void rebind();                     // ★全量重建后必调:prune(含自愈)+ 按谓词重装全部绑定
+
+    /**
+     * @brief ★全量重建后必调:prune(含自愈)+ 从根 DFS 按谓词重装全部绑定
+     */
+    void rebind();
 
     // ══ 读侧 API(ITreeSource 实现,模型唯一入口)══
     //   v4:干净页零枚举直接答缓存;脏页重算一次。跨调用不再 O(k²)。
-    size_t   childCount(GuiBase* node) override;
+    /**
+     * @brief 投影后的孩子数(唯一缓存校验点;脏页在这里触发重算)
+     * @param [in] node 被查询节点(有页答 flat 行数;组答成员数;透传答原始孩子数)
+     * @return size_t 孩子数;node 为空或组已被连锁淘汰时返回 0
+     */
+    size_t childCount(GuiBase* node) override;
+
+    /**
+     * @brief 投影序列第 i 个孩子(约定:模型先 childCount 校验,再 child 读缓存)
+     * @param [in] node 被查询节点
+     * @param [in] i 投影序列下标
+     * @return GuiBase* 第 i 个;越界/空节点返回 nullptr
+     */
     GuiBase* child(GuiBase* node, size_t i) override;
-    GuiBase* parentOf(GuiBase* node) override;     // 逐层下钻 deepest-wins(走 entries 单表)
-    int      rowOf(GuiBase* node) override;
-    bool     isGroup(GuiBase* node) const override;
+
+    /**
+     * @brief 投影父亲(可能是组;逐层下钻 deepest-wins,走 entries 单表)
+     * @param [in] node 被定位节点
+     * @return GuiBase* 投影父亲;node 为空返回 nullptr
+     */
+    GuiBase* parentOf(GuiBase* node) override;
+
+    /**
+     * @brief 在投影父亲孩子序列里的行号
+     * @param [in] node 被定位节点
+     * @return int 行号;-1 = 不在投影树上(被过滤/已死)
+     */
+    int rowOf(GuiBase* node) override;
+
+    /**
+     * @brief 判断节点是否为展示组(TreeGroup)
+     * @param [in] node 待判断节点
+     * @return bool true = 组节点
+     */
+    bool isGroup(GuiBase* node) const override;
 
 private:
     TreeProjection() = default;
@@ -255,23 +430,97 @@ private:
         unsigned bindGen = ~0u;
     };
 
-    // ★账页唯一创建点(v4 不再需要位图置位,建页就是这一行 operator[])。
+    /**
+     * @brief 账页唯一创建点:取(或建)parent 的账页引用
+     * @param [in] parent 页的持有者节点
+     * @return Projection& 账页引用(unordered_map 节点式,引用在任何插入下稳定)
+     */
     Projection& projection(GuiBase* parent) { return m_byParent[parent]; }
+
+    /**
+     * @brief 安装的内部实现(不含 prune;供 install 与 walkBindings 复用)
+     * @param [in] parent 被投影的父节点
+     * @param [in] spec 投影规格
+     * @param [in] siblings 静态参与名单(消毒后写入 pool)
+     * @return vector<TreeGroup*> 重算后的组列表
+     */
     std::vector<TreeGroup*> installInternal(GuiBase* parent, const ProjectionSpec& spec,
                                             const std::vector<GuiBase*>& siblings);
-    void installFromBinding(GuiBase* n, const SpecBinding& b);
-    void revalidate(GuiBase* parent, Projection& p);   // 脏才重算:过滤→分组→排序→建 entries
+
+    /**
+     * @brief walkBindings 的安装入口:同绑定(bindId+bindGen 未变)→ 跳过重装
+     * @param [in] node 谓词命中的节点
+     * @param [in] binding 命中的绑定(取它的 id 与 spec)
+     */
+    void installFromBinding(GuiBase* node, const SpecBinding& binding);
+
+    /**
+     * @brief 对分组按投影进行重映射(脏才重算:过滤→分组→排序→建 entries)
+     * @param [in] GuiBase* 被分组的父节点(其子结点会按规则被分组)
+     * @param [in/out] Projection& 对应于输入父节点的分组投影信息
+     */
+    void revalidate(GuiBase* parent, Projection& page);
+
+    /**
+     * @brief 拆掉 parent 的账页:级联拆组名下内层页,组按 deferDelete 立即删或入待回收队
+     * @param [in] parent 页持有者(允许死指针:只做 key 查找)
+     * @param [in] deferDelete true=组进 m_retired(读侧路径,契约 C1);false=当场 delete(写侧边界)
+     */
     void dropProjection(GuiBase* parent, bool deferDelete = false);
+
+    /**
+     * @brief 获取节点的原始子节点(绕过自身投影,防"组内分组"无限递归)
+     * @param [in] node 待获取子结点的节点
+     * @return vector<GuiBase*> 子结点列表(组=owner 成员表拷贝;普通节点=数据侧虚接口枚举)
+     */
     std::vector<GuiBase*> rawChildren(GuiBase* node);
-    const std::vector<GuiBase*>* freshMembers(TreeGroup* g);   // 组成员表就地引用(owner 先 revalidate)
-    // locate:parentOf/rowOf 共用的下钻定位 —— 返回 {投影父亲, 行号}(-1=需扫序列/不在投影树)。
+
+    /**
+     * @brief 取组的"新鲜成员表"就地引用(先 revalidate owner 页保证成员新鲜;不拷贝)
+     * @param [in] group 目标组
+     * @return const vector<GuiBase*>* 成员表地址(有效期到 owner 页下次重算为止,取得即用);
+     *         无 owner / owner 无页 / 组已被淘汰 → nullptr(等价旧行为:空表)
+     */
+    const std::vector<GuiBase*>* freshMembers(TreeGroup* group);
+
+    /**
+     * @brief parentOf/rowOf 共用的下钻定位(走 entries 单表,deepest-wins)
+     * @param [in] node 被定位节点
+     * @return pair<GuiBase*,int> {投影父亲, 行号};行号 -1 = 需调用方兜底扫描(透传父)
+     *         或不在投影树(被过滤/已死)
+     */
     std::pair<GuiBase*, int> locate(GuiBase* node);
-    // 把 parent 名下(传递)所有"有自己账页"的组置脏:组成员表源自 parent,parent 变则组必脏。
+
+    /**
+     * @brief 把 parent 名下(传递)所有"有自己账页"的组置脏
+     *        (组成员表源自 parent 页,parent 变则组页输入必变 → 连坐)
+     * @param [in] parent 刚被 invalidate 的页持有者
+     */
     void markGroupPagesDirty(GuiBase* parent);
-    // 自愈:枚举 node 的原始孩子与 lastLive 比对,漂移则置脏(+可选 stderr 点名)。返回是否发现漂移。
-    bool healIfDrift(GuiBase* node, Projection& p, bool verbose);
-    void collectReachable(GuiBase* root, PtrSet& seen);   // prune 的显式栈 DFS(含自愈)
-    void walkBindings(GuiBase* root, PtrSet& seen);       // rebind 的显式栈 DFS
+
+    /**
+     * @brief 漏通知自愈:枚举 node 原始孩子与 lastLive 比对,漂移则置脏(+可选点名)
+     * @param [in] node 账页持有者
+     * @param [in/out] page 其账页(漂移时 dirty 置位)
+     * @param [in] verbose true = 漂移时向 stderr 点名(paranoid 用);false = 静默自愈(prune 用)
+     * @return bool 是否发现漂移
+     */
+    bool healIfDrift(GuiBase* node, Projection& page, bool verbose);
+
+    /**
+     * @brief prune 的显式栈 DFS:收集从 root 可达的全部节点(含账页自愈);
+     *        只沿活枚举下行,死者走不到也绝不 deref
+     * @param [in] root DFS 起点
+     * @param [in/out] seen 已访问指针集(只做值哈希,永不 deref)
+     */
+    void collectReachable(GuiBase* root, PtrSet& seen);
+
+    /**
+     * @brief rebind 的显式栈 DFS:每个活数据节点跑全部绑定谓词,命中即安装
+     * @param [in] root DFS 起点
+     * @param [in/out] seen 已访问指针集
+     */
+    void walkBindings(GuiBase* root, PtrSet& seen);
 
     // ── 引擎全局表 ───────────────────────────────────────
     // m_byParent:总账本(装过投影的父亲 → 账页)。★unordered_map:读侧每步第一站,
@@ -305,25 +554,49 @@ namespace GroupRules {
 
 // 投影函数版:key 空 → 不分组留直属。★组节点默认【不进桶】(防 TreeGroup 套娃);
 //   多层分组里"组作为成员"必须手写规则显式收录组的 label(见 PROJECT.md §1.4)。
+/**
+ * @brief 构造"按投影函数取 key"的分组规则(空 key / 组节点 → 不分组)
+ * @param [in] proj 节点 → key 字符串(空串 = 留直属)
+ * @param [in] labeler 可选:key → 显示名(缺省 label = key)
+ * @return GroupRule 可直接装进 ProjectionSpec.grouping 的规则
+ */
 inline GroupRule byKey(std::function<std::string(GuiBase*)> proj,
                        std::function<std::string(const std::string&)> labeler = {})
 {
-    return [proj, labeler](GuiBase* n) -> std::optional<GroupTicket> {
-        if (!n || dynamic_cast<TreeGroup*>(n)) return std::nullopt;
-        std::string k = proj(n);
-        if (k.empty()) return std::nullopt;
-        GroupTicket t; t.key = k; t.label = labeler ? labeler(k) : k;
-        return t;
+    return [proj, labeler](GuiBase* node) -> std::optional<GroupTicket> {
+        if (!node || dynamic_cast<TreeGroup*>(node)) {
+            return std::nullopt;
+        }
+        std::string key = proj(node);
+        if (key.empty()) {
+            return std::nullopt;
+        }
+        GroupTicket ticket;
+        ticket.key = key;
+        ticket.label = labeler ? labeler(key) : key;
+        return ticket;
     };
 }
 
 // 谓词二分版:命中进组,不命中留直属(组节点同样默认豁免)。
+/**
+ * @brief 构造"谓词命中即进组"的二分规则
+ * @param [in] pred 命中谓词(true = 进组)
+ * @param [in] label 组名(同时作为 key)
+ * @param [in] order 组间排序提示
+ * @return GroupRule 可直接装进 ProjectionSpec.grouping 的规则
+ */
 inline GroupRule byPredicate(std::function<bool(GuiBase*)> pred, std::string label, int order = 0)
 {
-    return [pred, label, order](GuiBase* n) -> std::optional<GroupTicket> {
-        if (!n || dynamic_cast<TreeGroup*>(n) || !pred(n)) return std::nullopt;
-        GroupTicket t; t.key = label; t.label = label; t.order = order;
-        return t;
+    return [pred, label, order](GuiBase* node) -> std::optional<GroupTicket> {
+        if (!node || dynamic_cast<TreeGroup*>(node) || !pred(node)) {
+            return std::nullopt;
+        }
+        GroupTicket ticket;
+        ticket.key = label;
+        ticket.label = label;
+        ticket.order = order;
+        return ticket;
     };
 }
 
