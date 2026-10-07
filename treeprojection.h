@@ -261,20 +261,20 @@ public:
         size_t memberGroups = 0;   // page.members 的组条目数
         size_t memberPtr = 0;      // page.members 里成员指针总数
         size_t entries = 0;        // ★ page.entries 条目总数(= flat ∪ 各组成员,单一位置表)
-        size_t groupsVec = 0;
+        size_t ownedGroupsVec = 0;
         size_t groupOwner = 0;
         size_t pageObjBytes = 0;
         size_t lastLiveBytes = 0;
         size_t flatBytes = 0;
         size_t membersBytes = 0;
         size_t entriesBytes = 0;   // ★ 单表字节(替代 v3 的 memberToGroup+memberToPos+nodePage 三张)
-        size_t groupsBytes = 0;
+        size_t ownedGroupsBytes = 0;
         size_t groupOwnerBytes = 0;
         size_t specBytes = 0;
         size_t totalBytes() const {
             return pageObjBytes + specBytes + poolNodes * sizeof(void*) * 2
                  + lastLiveBytes + flatBytes + membersBytes
-                 + entriesBytes + groupsBytes + groupOwnerBytes;
+                 + entriesBytes + ownedGroupsBytes + groupOwnerBytes;
         }
         size_t groupObjBytes = 0;
         size_t retiredGroups = 0;
@@ -405,6 +405,18 @@ private:
     TreeProjection& operator=(const TreeProjection&) = delete;
 
     // 一个父亲的完整投影状态(账本的一页)。
+    //
+    // ★★ 读这一页之前,先分清【三个互相正交的关系】—— 它们各占各的字段,
+    //    混在一起正是这个结构最难读的地方:
+    //      位置(position)   : 它在本页的第几行?      → flat / entries[].row
+    //      容器(containment): 它显示在谁的肚子里?     → entries[].container
+    //      归属(ownership)   : 它的账页归本页管吗?     → ownedGroups
+    //    ⚠ 最容易踩的误解:ownedGroups **不是**"本层顶层摆着的组"(那是 flat 里的组),
+    //      而是"本页【拥有】的全部组",**含嵌在别的组肚子里的那些** ——
+    //      后者不在 flat 里(它们没有自己的行,只出现在收养者的成员表里),
+    //      但它们的账页仍然归本页管。
+    //      凡是"级联拆页 / 传递置脏 / 记账"这类操作,问的都是【归属】不是位置,
+    //      所以它们遍历 ownedGroups;而"这页顶层显示了几行"要从 flat 里挑组。
     struct Projection {
         // spec:本页投影定义(filter/grouping/less/opt)。写:install/bindSpec;读:revalidate 消费。
         ProjectionSpec spec;
@@ -416,8 +428,19 @@ private:
         std::vector<GuiBase*> lastLive;
         // flat:流水线最终产物(组+直属混排,组在首成员原位)。写:revalidate;读:childCount/child/rowOf。
         std::vector<GuiBase*> flat;
-        // groups:当前生效的组列表(引擎是唯一所有者)。写:revalidate;读:uninstall/析构/传播置脏。
-        std::vector<TreeGroup*> groups;
+        // ownedGroups:本页【拥有】的全部组(引擎是唯一所有者)。
+        //   构成 = (flat 里出现的组) ∪ (members 的键,即"活在别的组肚子里的嵌套组")。
+        //   ⚠ 别把它当成"本层顶层组"(那是 flat 里的组),也别当"这页显示了几行" ——
+        //     它与 flat【不平行】:其中的嵌套组一行都没有。
+        //   为什么必须含嵌套组:下面的消费者问的都是"本页名下有哪些组":
+        //     · dropProjection   —— 拆本页时要【级联】拆掉每个组自己的账页;
+        //       漏掉嵌套组 = 它的页泄漏 + m_groupOwner 残留。
+        //     · markGroupPagesDirty / revalidate 末尾的保守传播 —— 组成员表源自本页,
+        //       本页重算后名下组页必须连坐置脏。
+        //     · liveGroupCount —— 记账(测试的"退出时活组=0"就是靠它)。
+        //     · revalidate 取旧组做复用/淘汰的输入(union members 键,见那里的注释)。
+        //   写:revalidate 末尾;读:以上四处。
+        std::vector<TreeGroup*> ownedGroups;
         // members:组 → 活成员列表(已按 less 排序)。写:revalidate;读:freshMembers(组成员关系唯一存储处)。
         std::map<TreeGroup*, std::vector<GuiBase*>> members;
         // ★entries:本页唯一的"节点 → 投影坐标"表(v4 单表,替代 memberToGroup+memberToPos)。

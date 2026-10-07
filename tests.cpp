@@ -1088,7 +1088,7 @@ static void t23_nodePageCleanup() {
 //   场景:"不再有任何节点属于 Inner" 与 "Inner 属于 Outer" 同时成立。
 //   后者来自"按名字收组"(登记表里写着 Inner 的名字),前者来自"登记被删/改名/被过滤"。
 //   旧行为:Inner 被当成"沦为成员的旧组"保护下来,但它已经【没有任何成员】
-//   → 视图上 Outer 底下挂一个零成员的空组行;而且它不在 page.groups 里
+//   → 视图上 Outer 底下挂一个零成员的空组行;而且它不在 page.ownedGroups 里
 //   → dropProjection/uninstall 碰不到它 → liveGroupCount() 也数不到它
 //   → **静默泄漏,连"退出时活组=0"这条断言都抓不到**。
 //   ★ 本块的主判据不是"看不到空壳",而是恒等式
@@ -1166,7 +1166,7 @@ static void t24_shellGroup() {
           "★归属表条目数 == 活组数(空壳泄漏会打破这个等式 —— 修复前本行必红)");
 
     // ── 收尾:走调用方该走的那条路(uninstall + 回收)→ 两个账本必须双双归零。
-    //   空壳会在这里留下 m_groupOwner 残留(它不在 page.groups 里,uninstall 遍历不到)
+    //   空壳会在这里留下 m_groupOwner 残留(它不在 page.ownedGroups 里,uninstall 遍历不到)
     //   —— 这正是"泄漏检测的盲区":liveGroupCount() 答 0,而归属表还剩 1 条。
     P.uninstall(root);
     P.collectGarbage();

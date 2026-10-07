@@ -280,8 +280,8 @@ static void scenarioMem() {
     printf("    entries(位置单表)         %10.1f MB   (v3 时这里是三张表:\n",
            mbT(mb.entriesBytes));
     printf("      v3 对照:memberToGroup 54.1 + memberToPos 74.3 + nodePage 65.9 = 194 MB)\n");
-    printf("    p.groups + m_groupOwner   %10.1f MB\n",
-           mbT(mb.groupsBytes + mb.groupOwnerBytes));
+    printf("    p.ownedGroups+m_groupOwner%10.1f MB\n",
+           mbT(mb.ownedGroupsBytes + mb.groupOwnerBytes));
     printf("    ------------------------------------\n");
     printf("    引擎账本小计              %10.1f MB\n", mbT(mb.totalBytes()));
     printf("    (另:TreeGroup 对象本体    %10.1f MB)\n", mbT(mb.groupObjBytes));

@@ -45,7 +45,7 @@ bool TreeProjection::hasProjection(GuiBase* parent) const {
 size_t TreeProjection::liveGroupCount() const {
     size_t total = 0;
     for (const auto& pageEntry : m_byParent) {
-        total += pageEntry.second.groups.size();
+        total += pageEntry.second.ownedGroups.size();
     }
     return total;
 }
@@ -74,7 +74,7 @@ TreeProjection::MemBreakdown TreeProjection::memoryBreakdown() const {
             breakdown.memberPtr += memberEntry.second.capacity();
         }
         breakdown.entries += page.entries.size();  // ★ v4 单表(替代 memberToGroup+memberToPos)
-        breakdown.groupsVec += page.groups.capacity();
+        breakdown.ownedGroupsVec += page.ownedGroups.capacity();
         if (specPerPage == 0) {
             specPerPage = 32 * 3 + 32 * 2 + 8 + 16;
             if (page.spec.filter || page.spec.grouping || page.spec.less) {
@@ -90,7 +90,7 @@ TreeProjection::MemBreakdown TreeProjection::memoryBreakdown() const {
     breakdown.membersBytes = breakdown.memberGroups * 48 + breakdown.memberPtr * 8 + breakdown.memberGroups * 16;
     // entries:每槽 = key(8) + PosEntry(16) + 节点头(16)
     breakdown.entriesBytes = hashBytes(breakdown.entries, 8 + 16 + 16);
-    breakdown.groupsBytes = breakdown.groupsVec * 8;
+    breakdown.ownedGroupsBytes = breakdown.ownedGroupsVec * 8;
     breakdown.groupOwnerBytes = hashBytes(breakdown.groupOwner, 8 + 8 + 8 + 16);
     breakdown.groupObjBytes = breakdown.groupOwner * 96;   // TreeGroup 本体估算
     breakdown.retiredGroups = m_retired.size();
@@ -156,7 +156,7 @@ std::vector<TreeGroup*> TreeProjection::installInternal(GuiBase* parent, const P
     page.valid = false;          // 强制重算
     page.dirty = true;
     revalidate(parent, page);
-    return page.groups;
+    return page.ownedGroups;
 }
 
 // ══ ★数据侧变更通知(v4 契约)══════════════════════════════
@@ -209,7 +209,7 @@ void TreeProjection::markGroupPagesDirty(GuiBase* parent) {
     }
     PtrSet visited;
     std::vector<GuiBase*> pendingGroups;
-    for (TreeGroup* group : parentPageIt->second.groups) {
+    for (TreeGroup* group : parentPageIt->second.ownedGroups) {
         pendingGroups.push_back(group);
     }
     while (!pendingGroups.empty()) {
@@ -223,7 +223,7 @@ void TreeProjection::markGroupPagesDirty(GuiBase* parent) {
             continue;
         }
         groupPageIt->second.dirty = true;
-        for (TreeGroup* nestedGroup : groupPageIt->second.groups) {
+        for (TreeGroup* nestedGroup : groupPageIt->second.ownedGroups) {
             pendingGroups.push_back(nestedGroup);
         }
     }
@@ -357,7 +357,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     std::vector<GuiBase*> visibleNodes = ProjectionStages::filterLive(page.lastLive, page.spec.filter);
 
     // 旧组全单:顶层组 + 成员表里所有层的组(嵌套组也要能被复用/淘汰,否则孤悬泄漏)
-    std::vector<TreeGroup*> oldGroups = page.groups;
+    std::vector<TreeGroup*> oldGroups = page.ownedGroups;
     {
         std::set<TreeGroup*> seenGroups(oldGroups.begin(), oldGroups.end());
         for (const auto& memberEntry : page.members) {
@@ -451,7 +451,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     }
 
     // Stage B-2b:成员关系闭包 —— 剔除"自己的 key 没有桶"的空壳组(纯函数,见 projection_stages.h)。
-    // 不收敛的后果不只是视图多一个空组行:空壳不在 page.groups 里 → 本函数的淘汰分支
+    // 不收敛的后果不只是视图多一个空组行:空壳不在 page.ownedGroups 里 → 本函数的淘汰分支
     // 遍历不到它、liveGroupCount() 也数不到它 → 只在 m_groupOwner 里留一条静默泄漏。
     if (size_t shellCount = ProjectionStages::closeMembership(buckets); shellCount != 0) {
 #ifdef _DEBUG
@@ -504,7 +504,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
         // deferDelete=true:revalidate 由【读侧】(childCount==rowCount)也能触发,
         // 这里绝不能 delete —— 组进 m_retired 等 collectGarbage(契约 C1/C3)。
         dropProjection(culledGroup, /*deferDelete=*/true);   // 拆它名下的内层投影页
-        // ★ 组本身必须【单独】入队:dropProjection 遍历的是"该组自己页的 page.groups",
+        // ★ 组本身必须【单独】入队:dropProjection 遍历的是"该组自己页的 ownedGroups",
         //   它自己不在其中(它在【本页】的账上)—— 少了这一行 = 组既没回收、也没记账。
         noteRetired(culledGroup);
         removedGroups.insert(culledGroup);
@@ -545,7 +545,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
         }
     }
     const size_t oldFlatSize = page.flat.size();
-    const size_t oldGroupCount = page.groups.size();
+    const size_t oldGroupCount = page.ownedGroups.size();
     page.flat = ProjectionStages::buildFlat(flatParts, page.entries, parent);
     ProjectionStages::sortFlat(page.flat, page.spec.less);
 
@@ -566,7 +566,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
                 allGroups.push_back(memberEntry.first);
             }
         }
-        page.groups = allGroups;
+        page.ownedGroups = allGroups;
     }
 
     // ★ entries 阶段②:flat 行(container=owner,row=flat 序号)。
@@ -579,7 +579,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     // ★ 保守传播:本页名下凡有自己账页的组一律置脏(成员表可能变了)。
     //   深度=组嵌套层数、成本=O(组数) 的置位;过收敛的代价只是组页多一次重算 ——
     //   用"绝不精确 diff"换"绝不漏传播"(invalidate 侧还有一份传递置脏,双保险)。
-    for (TreeGroup* group : page.groups) {
+    for (TreeGroup* group : page.ownedGroups) {
         auto groupPageIt = m_byParent.find(group);
         if (groupPageIt != m_byParent.end()) {
             groupPageIt->second.dirty = true;
@@ -591,7 +591,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     page.dirty = false;
     // 结构版本号:只有"形状真的变了"才递增(组增删 或 行数变化)。
     // 内容变化(同形状下的成员替换)不递增,因为它不破坏模型坐标。
-    if (!removedGroups.empty() || page.flat.size() != oldFlatSize || page.groups.size() != oldGroupCount) {
+    if (!removedGroups.empty() || page.flat.size() != oldFlatSize || page.ownedGroups.size() != oldGroupCount) {
         ++m_structRev;
     }
 }
@@ -607,7 +607,7 @@ void TreeProjection::dropProjection(GuiBase* parent, bool deferDelete) {
     Projection& page = pageIt->second;
     // ★ v4:位置索引(entries)是页内成员,随 m_byParent.erase 一起析构 ——
     //   没有全局副本要清,v3 R2 那类"登记/清理不对称"泄漏在结构上不可能发生。
-    for (TreeGroup* group : page.groups) {
+    for (TreeGroup* group : page.ownedGroups) {
         m_groupOwner.erase(group);
         dropProjection(group, deferDelete);               // ★级联:组名下的内层投影页先拆
         if (deferDelete) {

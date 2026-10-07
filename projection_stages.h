@@ -140,7 +140,7 @@ inline bool shouldCollapse(const std::vector<Bucket>& buckets, size_t participan
  *        多层的典型触发:内层组的登记被删/改名/成员被过滤(→ A 失去自己的桶),
  *        而外层组的成员名单里还写着 A 的名字(→ 规则仍对 A 这个节点出外层票)。
  *
- *        ★ 不收敛的代价不只是"多一个空行":空壳组不被任何 page.groups 收录,
+ *        ★ 不收敛的代价不只是"多一个空行":空壳组不被任何 page.ownedGroups 收录,
  *          于是 dropProjection/uninstall 遍历不到它、liveGroupCount() 也数不到它
  *          ⇒ **静默泄漏,连"退出时活组 = 0"这条断言都抓不到**。
  *          (它只在全局 m_groupOwner 里留一条,那是唯一还能观测到它的地方。)
