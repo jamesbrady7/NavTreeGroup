@@ -619,14 +619,34 @@ void TreeProjection::dropProjection(GuiBase* parent, bool deferDelete) {
     m_byParent.erase(pageIt);   // 哈希表:递归只 erase 别的 key,本迭代器仍有效
 }
 
-// 真正释放已淘汰的组 —— 全工程唯一 delete TreeGroup 的地方(除引擎析构与写侧立即释放)。
-// ★ 调用时机契约:视图的 persistent index 全部失效之后,即 begin/endResetModel 或
-//   begin/endRemoveRows 之内。NavTreeModel 的 endFullReset/endRowRemoval 已自动调用。
+// 真正释放【整个】退役队列 —— 只在 **reset 通道** 内安全。
+// ★ 原因:`endResetModel()` 会让 Qt 作废【全部】persistent index,所以队列里
+//   无论新旧都已经是"无效坐标",整批释放安全。
+//   ⚠ removeRows 通道【不能】用它:endRemoveRows() 只作废【该 parent 下 [first,last] 行】,
+//   队列里更早入队的组(淘汰发生在纯读里、没有任何信号覆盖过它的行)仍被 Qt 认为有效 ——
+//   释放它们 = 视图持有悬空 internalPointer(探针 P4 实证)。removeRows 通道用下面那个。
 void TreeProjection::collectGarbage() {
     for (TreeGroup* retiredGroup : m_retired) {
         delete retiredGroup;
     }
     m_retired.clear();
+}
+
+// 只释放 waterMark 之后入队的退役组 —— **removeRows 通道专用**。
+// 队列是"先进先出地被整体兑现"的:waterMark = 本窗口开始时的水位,
+// [waterMark, ·) 就是"本窗口内新退役的"那一批 —— 它们的坐标恰好被本次
+// `beginRowRemoval(par,row)` 的信号覆盖(蒸发点就是信号点,这是 cascadeTarget 协议的产物)。
+// 更早的残留(来自没有任何信号覆盖的淘汰)**不能碰**,留给下一次 reset 通道。
+// 代价:若调用方长期只走 removeRows 通道,更早的残留会一直躺着 ——
+//   但它们本来就只是"待回收内存",不影响正确性;下一次 reset 会整批清掉。
+void TreeProjection::collectGarbageSince(size_t waterMark) {
+    if (waterMark >= m_retired.size()) {
+        return;   // 本窗口没有新增退役组(最常见:组被复用,根本没淘汰)
+    }
+    for (size_t i = waterMark; i < m_retired.size(); ++i) {
+        delete m_retired[i];
+    }
+    m_retired.resize(waterMark);   // 保留更早的残留,等 reset 通道
 }
 
 void TreeProjection::uninstall(GuiBase* parent) {
@@ -636,8 +656,13 @@ void TreeProjection::uninstall(GuiBase* parent) {
 // ══ 生命周期卫生(三政体生存法则) ══
 
 // 腿①:显式讣告。纯 map 操作,全程不解引用 dying(它可能正在析构栈上,虚表已退化)
+// ★ 组对象【延迟】释放(2026-10-07 改):讣告可能在任何地方被调 —— `notifyRemove`
+//   就内含它,而 notifyRemove 的调用前提里【没有】"必须在括号内"(§1.1 只要求
+//   "在 delete dying 之前")。当场 delete 组 = 视图的 persistent index 还悬着 → UAF。
+//   ⚠ 册页本身仍然【立即】拆掉:它是以"正在死的指针"为键的,留着就是僵尸账页/幽灵附体,
+//   必须当场清。只有【组对象】进 m_retired 等括号兑现。
 void TreeProjection::discard(GuiBase* dying) {
-    dropProjection(dying);
+    dropProjection(dying, /*deferDelete=*/true);
 }
 
 void TreeProjection::registerRoot(GuiBase* root) {

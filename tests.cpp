@@ -1165,20 +1165,93 @@ static void t24_shellGroup() {
     delete root;
 }
 
+// T25:Pipeline::closeMembership 的纯函数测试(成员关系的闭包)
+//   它是 Stage B-2b 的唯一实现,也是"空壳组"缺陷的正面对策 ——
+//   按工程约定(每个 pipeline 纯函数配"输入→输出"实例)单列一块。
+//   四类边界:空输入 / 已闭合(不误杀) / 单壳(含"宿主只剩空壳") / 多层依赖(必须迭代收敛)。
+//   ★ 分辨力:第 ④ 条是给"把迭代改成单轮过滤"准备的红靶子 ——
+//     单轮实现会停在 A:[B](dropped=1、桶不退空),该断言立刻变红。
+//   ⚠ 纯函数纪律:它【不删】任何组对象,测试自己负责 delete。
+static void t25_closeMembership() {
+    hdr("T25", "Pipeline::closeMembership(成员关系闭包)",
+        "剔除空壳组 + 丢掉随之变空的桶;空输入/已闭合/单壳/多层依赖四类边界");
+    using Pipeline::Bucket;
+
+    NamedData d1("D1"), d2("D2");              // 只当"不是组"的成员用,不接入任何树
+
+    auto makeGroup = [](const std::string& key) {
+        GroupTicket t; t.key = key; t.label = key;
+        return new TreeGroup(t, nullptr);       // owner=null:本函数只读 ticket().key,不会 deref owner
+    };
+    auto makeBucket = [](const std::string& key, std::vector<GuiBase*> members) {
+        Bucket b;
+        b.ticket.key = key;
+        b.ticket.label = key;
+        b.members = std::move(members);
+        return b;
+    };
+
+    // ① 空输入
+    {
+        std::vector<Bucket> buckets;
+        const size_t dropped = Pipeline::closeMembership(buckets);
+        check(dropped == 0 && buckets.empty(), "① 空输入:返回 0、保持空");
+    }
+    // ② 已闭合:成员全是数据节点 → 一个都不动(不误杀)
+    {
+        std::vector<Bucket> buckets = { makeBucket("A", { &d1, &d2 }) };
+        const size_t dropped = Pipeline::closeMembership(buckets);
+        check(dropped == 0 && buckets.size() == 1 && buckets[0].members.size() == 2,
+              "② 已闭合:没有组成员 → 原样不动(dropped=0)");
+    }
+    // ③ 单壳:组成员 key=Inner 却没有 Inner 桶 ⇒ 剔除该成员,宿主桶其余成员保留
+    {
+        TreeGroup* shell = makeGroup("Inner");
+        std::vector<Bucket> buckets = { makeBucket("Outer", { shell, &d1 }) };
+        const size_t dropped = Pipeline::closeMembership(buckets);
+        check(dropped == 1 && buckets.size() == 1
+              && buckets[0].members.size() == 1 && buckets[0].members[0] == &d1,
+              "③ 单壳:空壳组被剔除、宿主桶保留其余成员(dropped=1)");
+        delete shell;
+    }
+    // ③b 宿主桶只剩那个壳 ⇒ 桶变空 ⇒ 连桶一起丢(否则视图留一个空组行)
+    {
+        TreeGroup* shell = makeGroup("Inner");
+        std::vector<Bucket> buckets = { makeBucket("Outer", { shell }) };
+        const size_t dropped = Pipeline::closeMembership(buckets);
+        check(dropped == 1 && buckets.empty(), "③b 宿主只剩空壳:连桶一起丢掉");
+        delete shell;
+    }
+    // ④ 多层依赖:必须迭代到不动点
+    //    A:[B]  B:[C]  C 无桶 ⇒ C 是壳 → 剔 → B 空 → 丢桶 ⇒ B 变非代表 → 从 A 剔 → A 空 → 丢桶
+    {
+        TreeGroup* gA = makeGroup("A");
+        TreeGroup* gB = makeGroup("B");
+        TreeGroup* gC = makeGroup("C");
+        std::vector<Bucket> buckets = { makeBucket("A", { gB }), makeBucket("B", { gC }) };
+        const size_t dropped = Pipeline::closeMembership(buckets);
+        showOut("多层依赖:dropped=" + std::to_string(dropped)
+                + " 剩余桶=" + std::to_string(buckets.size()) + "(期望 2 / 0)");
+        check(dropped == 2 && buckets.empty(),
+              "★④ 多层依赖:C 是壳 → B 随之变壳 → A 也随之变空;迭代两轮收敛(dropped=2、桶全空)");
+        delete gA; delete gB; delete gC;    // 纯函数不删对象,测试自删
+    }
+}
+
 int main() {
     silenceCrtDialogs();
 #ifdef Q_OS_WIN
     SetConsoleOutputCP(CP_UTF8);
 #endif
-    printf("NavTreeGroup unit_tests:24 块,每块打印 职责/输入/输出/校验\n");
+    printf("NavTreeGroup unit_tests:25 块,每块打印 职责/输入/输出/校验\n");
     t1_filter();  t2_bucket();  t3_collapse(); t4_reuse(); t5_flat(); t6_sort();
     t7_endToEnd(); t8_cache(); t9_rowOf(); t10_evaporate(); t11_multiLayer(); t12_deathOfOwner();
     t13_prune(); t14_rebind();
     t15_model(); t16_signals();
     t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_paranoidAndHeal();
-    t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup(); t24_shellGroup();
+    t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup(); t24_shellGroup(); t25_closeMembership();
     printf("\n══════ 汇总:%s(失败块数 = %d,即退出码)══════\n",
-           g_fail ? "有 FAIL" : "24 块全绿", g_fail);
+           g_fail ? "有 FAIL" : "25 块全绿", g_fail);
     printf("engine live groups at exit = %d\n", (int)P.liveGroupCount());
     return g_fail ? 1 : 0;
 }

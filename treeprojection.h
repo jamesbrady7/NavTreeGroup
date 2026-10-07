@@ -205,17 +205,23 @@ public:
     //   【视图 persistent index 全部失效之后】(= begin/endReset 或 begin/endRemoveRows 之内)真正 delete。
     //   NavTreeModel 的 endFullReset/endRowRemoval 已自动调用 → 走这两条通道的调用方零心智负担。
     /**
-     * @brief 真正释放已淘汰的组(全工程唯一安全释放点;契约 C3)
-     *        必须在 begin/end(reset 或 removeRows)括号内调用 ——
-     *        此刻 Qt 已令相关 persistent index 失效
+     * @brief 真正释放【整个】退役队列(契约 C3)
+     * @note ⚠ 只在 **reset 通道** 内安全:`endResetModel()` 作废全部 persistent index。
+     *       removeRows 通道(只作废它覆盖的行范围)请用 collectGarbageSince —— 见其注释。
      */
     void collectGarbage() override;
+
+    /**
+     * @brief 只释放 waterMark 之后入队的退役组(removeRows 通道专用;契约 C3)
+     * @param [in] waterMark 窗口开始时的队列水位(= 当时的 retiredCount())
+     */
+    void collectGarbageSince(size_t waterMark) override;
 
     /**
      * @brief 待回收组数(m_retired 当前深度;长期不清会堆积,用它自检)
      * @return size_t 已淘汰但尚未 delete 的组数
      */
-    size_t retiredCount() const { return m_retired.size(); }
+    size_t retiredCount() const override { return m_retired.size(); }
 
     /**
      * @brief 是否有待回收的组

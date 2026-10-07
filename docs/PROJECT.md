@@ -15,9 +15,12 @@
 > `[实测]` = 跑过命令/探针,有输出证据 · `[读码]` = 只做过源码审读,未独立运行验证
 > · `[论证]` = 只有推理,无实证(必须写出"为什么暂时无法实证")
 >
-> 最后更新:**空壳组修复 + 对接契约修正(2026-10-07,perf-round2 分支)** —— 新增不变量 #11
-> (成员表闭合 / `closeMembership` / T24)、C5 补"属性漂移无兜底"、§1.5 补异常窗口、
-> §1.1 补通知 API、§3 补 paranoid 首发纪律;并修掉三处 v4 遗留的文档漂移。
+> 最后更新:**回收粒度修复(2026-10-07,探针 P4 实证)** —— C3 改写为"两个回收粒度必须匹配
+> 坐标作废的范围"(`collectGarbage` 只给 reset 通道 / `collectGarbageSince` 给 removeRows 通道),
+> C2 修订(`discard` 退出"立即释放",改延迟),`NavTreeModel::endRowRemoval` 改为按水位回收;
+> 新增 **T25**(closeMembership 纯函数)与 **P4** 探针。此前同日:**空壳组修复 + 对接契约修正** ——
+> 新增不变量 #11(成员表闭合 / `closeMembership` / T24)、C5 补"属性漂移无兜底"、
+> §1.5 补异常窗口、§1.1 补通知 API、§3 补 paranoid 首发纪律;并修掉三处 v4 遗留的文档漂移。
 > 此前:**v4 重构(2026-10-07)** 脏通知契约取代惰性发现,设计全文见 **docs/重构v4_脏通知.md**,
 > 性能/内存对比见 §3,契约变化见 C5(v4)/C8(作废);
 > 第三方评审(2026-10-06)修复 R1/R2/R3;实现方(第三轮)§5 缺口全关闭。
@@ -59,7 +62,7 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 & "$P\build\Release\bench.exe" cold,regroup  # C4 实证:换规则 → 延迟释放峰值      ← 有前置依赖
 & "$P\build\Release\bench.exe" gcstress    # 内存安全压测(Release 只查泄漏)
 & "$P\build\Debug\bench.exe"   gcstress    # ★Debug 版才有 _CrtCheckMemory 堆校验
-& "$P\build\Release\probe_review.exe"      # 评审探针:R1/R2/R3 三疑点,期望 summary: 0 confirmed
+& "$P\build\Release\probe_review.exe"      # 评审探针:P1~P4 四疑点,期望 summary: 0 confirmed
 ```
 
 ### ⚠ bench 场景的【前置依赖】(2026-10-06 交叉验证发现 —— 以前是个假绿灯)
@@ -119,11 +122,12 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 | `childCount` / `child` / `parentOf` / `rowOf` | **读侧** | 可能(惰性重算) | **绝不** | 无(随时可调) |
 | `isGroup` / `hasProjection` / `liveGroupCount` / `retiredCount` / `hasRetired` / `structRev` / `memoryBreakdown` | 纯观测 | 否 | 否 | 无 |
 | `install` / `apply` / `refresh` / `uninstall` / `ungroup` | 写侧 | 是 | **是(立即 delete)** | **必须在 reset 括号内**(或视图未创建/已销毁) |
-| `discard(dying)` | 写侧 | 是 | **是(立即 delete)** | 必须在 `delete dying` **之前**调 |
+| `discard(dying)` | 写侧 | 是 | 否(**组进 `m_retired`**;册页立即拆) | 必须在 `delete dying` **之前**调 |
 | `prune()` | 写侧 | 是(清僵尸) | **是(立即 delete)** | 必须在 reset 括号内 |
-| `invalidate(p)` / `invalidateNode(n)` / `notifyRemove(p,d)` / `invalidateAll()` | **通知(v4 新增)** | 否(只 O(1) 置脏,不重算) | 否 | `notifyRemove` 必须在 `delete dying` **之前**调;其余无 |
+| `invalidate(p)` / `invalidateNode(n)` / `notifyRemove(p,d)` / `invalidateAll()` | **通知(v4 新增)** | 否(只 O(1) 置脏,不重算) | 否 | `notifyRemove` 必须在 `delete dying` **之前**调(它内含 `discard`);其余无 |
 | `bindSpec` / `unbindSpec` / `rebind` | 写侧 | 是 | `rebind` 间接 | 必须在 reset 括号内 |
-| `collectGarbage()` | **回收** | 否 | **是(唯一安全释放点)** | **必须在 begin/end(reset 或 removeRows)之内** |
+| `collectGarbage()` | **回收** | 否 | **是(唯一安全释放点)** | **`endResetModel()` 之后**;release 通道见 C3 |
+| `collectGarbageSince(mark)` | **回收(细粒度)** | 否 | 是(begin 之后入队的那一段) | **`endRemoveRows()` 之后**,`mark` 取自 begin 时的 `retiredCount()` |
 
 ### 1.2 九条契约(逐条给证据与后果)
 
@@ -136,17 +140,37 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
   `childCount(root)`,`retiredCount 0→1`、组地址未被复用)。
 
 **C2 —— 写侧立即释放,且必须在 reset 括号内。** `[读码]`
-`uninstall`/`discard`/`prune` 走 `dropProjection(..., deferDelete=false)`(`TreeProjection::dropProjection` 的默认实参),
+`uninstall`/`prune` 走 `dropProjection(..., deferDelete=false)`(`TreeProjection::dropProjection` 的默认实参),
 即**当场 `delete`,不进 `m_retired`**。
 - ⚠ 特别注意 `prune()`:它会被 `install`/`refresh` 当"操作边界自愈"**自动执行**,所以
   **`install`/`refresh` 自身也必须处在 reset 括号内**。
+- **⚠ v4 后继修订(2026-10-07):`discard` 已退出这条 —— 它改为延迟释放。**
+  原因:`discard` 是 `notifyRemove` 的内含步骤,而 `notifyRemove` 的调用前提里
+  **没有**"必须在括号内"(§1.1 只要求"在 `delete dying` 之前")⇒ 当场 delete 组 =
+  视图的 persistent index 还悬着 = UAF。现在 `discard` 走 `deferDelete=true`:
+  **册页仍立即拆掉**(它按"正在死的指针"做键,留着就是僵尸账页),**只有组对象**进 `m_retired` 等括号兑现。
+  仍在立即释放的只剩 `uninstall` / `prune` —— 这两条都明文要求 reset 括号内,且 reset 通道
+  作废全部坐标,所以安全口径闭合。
 - 违反后果:与 C1 同形状的 UAF。
 
-**C3 —— `collectGarbage()` 是唯一安全释放点,时机在坐标失效之后。** `[实测]`
-定义 `TreeProjection::collectGarbage`;析构兜底 `~TreeProjection`(同样调 `collectGarbage`)。
-`NavTreeModel` 已自动履约:`endFullReset()` 与 `endRowRemoval()`
-在 `endResetModel()`/`endRemoveRows()` **之后**调用它 —— 此刻 Qt 已令相关 persistent index 失效。
-- 违反后果:早回收 = C1 的 UAF 回归;永不调用 = `m_retired` 堆积(可用 `retiredCount()` 自检)。
+**C3 —— 回收点有两个粒度,必须匹配"坐标作废的范围"。** `[实测]`(P4 实证后修订)
+定义 `TreeProjection::collectGarbage` / `collectGarbageSince`;析构兜底 `~TreeProjection`。
+`NavTreeModel` 已自动履约,但**两条通道用的不是同一个粒度**:
+- **reset 通道**(`endFullReset()`):`endResetModel()` 作废**全部** persistent index
+  ⇒ 调 `collectGarbage()` 释放**整队列**,安全。
+- **removeRows 通道**(`endRowRemoval()`):`endRemoveRows()` **只作废该 parent 下 `[first,last]` 行**
+  ⇒ 只能调 `collectGarbageSince(mark)` 释放**本窗口新退役的**那一段;队列里更早入队的组
+  (淘汰发生在**纯读**里、没有任何信号覆盖过它的行)**必须留着**,等下一次 reset 通道。
+- ⚠ **坐标作废发生在 `end`,不是 `begin`。** 所以"在 begin/end 之内"要读成
+  "**`end` 调用之后**";在 begin 与 end 之间释放是不安全的。
+- **P4 实证**(`probe_review.cpp`):修复前用整队列 `collectGarbage()` 收 removeRows 窗口 →
+  实测"队列 1→0(组确实被释放)"而"视图侧 `held.isValid()` 仍为 true"⇒ 那个 persistent index
+  的 `internalPointer` 已悬空,之后任何 `rowCount(held)`/展开态检查都是 UAF。
+  这不是"调用方违约"才有的路径 —— `notifyRemove` 的调用前提里本就没有括号要求(见 C2 修订)。
+- 代价:若调用方长期只走 removeRows 通道,更早的残留会一直躺着(只是"待回收内存",不影响正确性);
+  下一次 reset 会整批清掉。用 `retiredCount()` / `retiredHighWater()` 观测。
+- 违反后果:**早回收** = C1 的 UAF 回归;**粒度错配** = P4 那条(同样是 UAF);
+  **永不调用** = `m_retired` 堆积。
 
 **C4 —— `m_retired` 的峰值已量化:换规则时 ≈ 账本的 12%。** `[实测]`
 - 原描述"一次性 wipe 十万组峰值多吃 9~10 MB"**归因错了**,实测 `rebuild` 通道里
@@ -470,7 +494,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 | 目标 | 期望 | 实测(Release / Debug) |
 |---|---|---|
-| `unit_tests` | 退出码 = 失败块数 = 0 | **24 块全绿,双配置**(2026-10-07 新增 **T24 空壳组**:用"归属表条目数 == 活组数"这个恒等式抓出"活着却不归任何页管"的静默泄漏 —— 修复前该块 3 条 FAIL 作分辨力;此前 2026-10-06 评审轮新增 T22 裸坐标新鲜度 / T23 entries 随页清理;T21 阈值分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
+| `unit_tests` | 退出码 = 失败块数 = 0 | **25 块全绿,双配置**(2026-10-07:新增 **T24 空壳组** —— 用"归属表条目数 == 活组数"这个恒等式抓出"活着却不归任何页管"的静默泄漏,修复前 3 条 FAIL 作分辨力;新增 **T25 closeMembership 纯函数** —— 四类边界,其中"多层依赖"是为"把迭代改成单轮过滤"准备的红靶子;此前 2026-10-06 评审轮新增 T22 裸坐标新鲜度 / T23 entries 随页清理;T21 阈值分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
 | `navtree_demo` | 退出码 0,不变量通过 | ✔ 通过 |
 | `gui_demo` | 退出码 0 | ✔ 模型不变量 13 项 + 终检 10 项 |
 | `tree_tabs --selftest` | `selftest PASS` | ✔ |
@@ -482,7 +506,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 | `bench gcstress` | 残留=0、无堆损坏、无累积泄漏 | ✔ Debug:200 轮(100 轮走 prune 野 key 路径)堆校验 **0 失败**;Release:`[SKIP]` 堆校验、WS +3.0 MB。详见 §5「ASan 替代实证」 |
 | `bench cold,<场景>` × 9 | exit=0 | ✔ 依赖账本的 9 个场景(`hot/query/model/incr/rebuild/prune/iloop/mem/regroup`)必须带 `cold` 前缀 |
 | `bench <场景>` × 9(单跑) | **故意 exit=1** | ✔ 缺前置 = 测量无效,显式判失败(旧行为是静默给 0 + exit 0,那才是 bug) |
-| `probe_review` | `summary: 0 confirmed` | ✔ 三疑点(纪元缺口/索引清理/组上求值 locate)修复后全 OK(2026-10-06 评审轮) |
+| `probe_review` | `summary: 0 confirmed` | ✔ 四个探针全 OK:P1 通知契约两半 / P2 entries 随页 / P3 组上零求值(V4 前身 R1/R2/R3,2026-10-06 评审轮)+ **P4 退役组 vs 视图 persistent index**(2026-10-07)。P4 两段判据:**P4a** removeRows 窗口不得释放"未被本次信号覆盖"的更早残留;**P4b** reset 通道必须"既释放(retired=0)、又已作废坐标(held.isValid=0)"。**修复前 P4 CONFIRMED**(实测 retired 1→0 而 held 仍有效),修复后两段皆 OK |
 
 ### bench 的 CHECK 退出码契约(2026-10-05 新增,踩坑换来的)
 
@@ -569,7 +593,7 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 | 路径 | 轮数 | 做法 | 验证什么 |
 |---|---|---|---|
-| A | 100 | 删前 `discard()` 显式讣告 | 账页当场清、组立即 delete |
+| A | 100 | 删前 `discard()` 显式讣告 | 账页**当场清**、组进 `m_retired`(2026-10-07 起延迟,见 C2 修订) |
 | B | **100** | 删前**不** discard | 账页 key 变野指针 → 只能靠 `prune` 可达性剪枝清理;**DFS 途中会拿野 key 做 map 查找/比较** |
 
 **实测结果**(2026-10-05,Debug + Release 双跑):
@@ -639,3 +663,4 @@ gcstress-x200  200 轮(含 prune 剪枝路径 100 轮) | 残留待回收累计=0
 | **2026-10-07(代码格式规范化:引擎六文件)** | 用户定三条规矩,引擎核心全部对齐:① **头文件函数注释统一 Doxygen**(`@brief/@param [in|out]/@return`,范本=revalidate/rawChildren 用户手改样式),覆盖 treeprojection.h / pipeline.h / ptrset.h / itreesource.h / navtreemodel.h 全部函数;② **所有 if/while/for 一律换行加大括号**(含单语句 return/continue,范本=revalidate 函数体),消灭"一行挤三条"的读码地雷;③ **无语义变量全部更名**:p→page、kv→pageEntry/memberEntry、pit→pageIt、oit→ownerIt、mit→membersIt、git→groupPageIt、eit→posIt、n→node、g→group、c→child、mem→memberList、b→binding、vis→visibleNodes、oldAll→oldGroups、culled→culledGroups、deleted→removedGroups、stale→stalePages 等(cpp 注释按用户要求原样保留,仅同步注释里引用的变量名)。范围=引擎六文件(treeprojection.h/.cpp、pipeline.h、ptrset.h、itreesource.h、navtreemodel.h);demo/tests/bench 未动。**纯格式与命名,零语义变化** | `[实测]` 双配置 clean build **0 错误 0 警告**;回归 12 项(Release:unit/nav/gui/tabs/inter/probe/bench + Debug:unit/inter/gui/tabs/nav)exit 全 0 |
 | **2026-10-07(用户现场 bug:删一个组,其它组展开状态全被重置为展开)** | 诊断:**非引擎、非 Qt 缺陷,是 demo 视图层两处行为叠加** —— ① `endResetModel` 的 Qt 语义就是"所有 index 失效、视图丢弃全部展开状态"(生产"更新→reset"通道同样会遇到);② 旧 `structuralReset` 随后**无条件 `expandAll()`**,把手动折叠过的组也强行拉开。引擎侧恰恰是为保状态设计过的:`matchReusable` 按 key 复用旧 TreeGroup 指针(同 key 组跨重算指针稳定)+ C1 延迟回收保证 reset 括号内旧指针内存有效 —— 展开状态**有得保**,只是没被消费。修复(视图层标准配方):reset 前模型遍历收集展开节点【指针集合】→ reset 后遍历活投影树,只对"活树 ∩ 之前展开"恢复 `setExpanded(true)`,新节点默认折叠;删除无条件 expandAll(仅保留 视图初次切换/手动"展开全部"按钮/onRebuild 三处刻意全展开语义)。已知良性瑕疵:退役组地址被新组复用时会多展开一次(纯外观);生产要零误认改用业务 key 做恢复键,套路相同 | `[实测]` interactive --selftest 双配置 PASS、--smoke 通过、0 错误 0 警告 |
 | **2026-10-07(空壳组修复 + 对接契约修正)** | ① **引擎修**:新增纯函数 `Pipeline::closeMembership`(Stage B-2b,迭代到不动点)—— 剔除"自己的 key 没有桶"的空壳组 + 丢掉随之变空的桶;`revalidate` 调用它,Debug 下 stderr 点名"规则输出自相矛盾"。起因:多层分组下"内层组失去全部成员,却仍被外层组按名字收着"→ 零成员空壳组。**真正的伤害不是多一个空行**:空壳只是 members 的 value、不是 key ⇒ 不在 `page.groups` ⇒ `dropProjection`/`uninstall`/`liveGroupCount()` 全部遍历不到它 ⇒ **静默泄漏**(实测 `uninstall` 后 `liveGroupCount()=0` 而归属表残留 1)。② **测试**:新增 **T24**(24 块),判据是恒等式 `memoryBreakdown().groupOwner == liveGroupCount()`;修复前 **3 条 FAIL**(实测"活组1/归属2""uninstall 后 0/1")⇒ 有分辨力;测试还当场抓出作者自己的场景 bug(漏给 C 出票)。③ **demo 根治**:`onDeleteGroup` 补"删除侧"引用清理 —— 把该组 label 从其它手动组成员名单里摘掉、并丢掉被摘空的登记(与 `doGroup` 建组时的"从其它组摘名字"对称;只做增侧清理 = 规则会输出自相矛盾的票)。④ **可读性**:`installGrouping` → **`syncPageRule`**(它实为"按当前登记把这一页重新投影一遍"),并补注释说明"删一个组为何走 `install` 而不是 `uninstall`"。⑤ **文档修正**:新增不变量 **#11**(成员表闭合)、C5 补"**属性漂移没有任何兜底**"警告(三层兜底比的都是孩子列表)、§1.5 补异常窗口(§516 换 members 而 §568 才换 groups,中间调用用户 `less`,抛异常即留下同 key 双胞胎 —— **这才是 `groupsKeptAsMember` 必须保留的真理由**,不是"多层存活路径")、§1.1 补通知 API 行、§3 补 paranoid 首发纪律、修掉三处 v4 遗留漂移(§1.5 checkedAt / §2#7 memberToGroup / §4 m_nodePage)。⑥ **bench 拆地雷**:`scenarioIncremental` 的 victims 由有放回抽样改 **`std::sample`**(无放回)—— 旧写法会对同一 leaf 二次 delete,`seed 123` 恰好 0 次重复掩盖了它,换随机 seed 约四成概率会撞。⑦ 同窗口另有两次 interactive 修复(工厂组解散只解散该组 `f624d5f`、结构变更跨 reset 保展开态 `e0a4fed`),详见各自提交 | `[实测]` 七目标 × 双配置 exit 全 0、**0 错误 0 警告**;`unit_tests` **24 块** × 双配置;`interactive --selftest` 66 [OK] PASS;bench 全模式(all/deep/dbg/gcstress/cold,prune/cold,mem/cold,regroup)× 双配置 `CHECK=0`;probe **0 confirmed**;Release bench **TOTAL 2288.9 ms / WS 326 MB / 账本 108.6 MB**(与 §3 基线一致,无回归);新诊断首轮全量回归中**仅在 T24 的设计场景命中一次**,其余 23 块 + 七 demo + bench 零噪声 |
+| **2026-10-07(回收粒度:探针 P4 实证的 release 通道 UAF)** | **发现**:写 P4 探针检验 C1 的防线,在"**守约但不带括号**的调用"路径上**坐实一个 UAF** —— `notifyRemove` 的调用前提本就没有括号要求(§1.1),之后一次纯读触发组蒸发入 `m_retired`;此时**任何一次不相干的精准删除**都会走 `endRowRemoval()` → 整队列 `collectGarbage()` → 把这个"从未被任何信号覆盖过"的组 release 掉。而 `endRemoveRows()` **只作废该 parent 下 `[first,last]` 行的** persistent index ⇒ 视图侧仍认为它有效。**P4 实测**:`retired 1→0`(组确实被释放)而 `held.isValid()==1`(Qt 从没被告知)⇒ `internalPointer` 悬空,之后任何 `rowCount(held)`/展开态检查都是 UAF。**根因不是"忘了通知",是两个回收点与两种坐标作废范围不匹配**(reset 作废全部 / removeRows 只作废范围),而 `collectGarbage()` 一律清整队列。**修复**:① 窄接口新增 `retiredCount()`(水位)+ `collectGarbageSince(mark)`;② `NavTreeModel::beginRowRemoval` 记水位、`endRowRemoval` 只回收本窗口新退役的那一段(reset 通道仍用整队列 `collectGarbage`,因为 `endResetModel` 作废全部坐标);③ **`discard` 改延迟释放**(`deferDelete=true`)—— 它是 `notifyRemove` 的内含步骤而后者不要求括号,当场 delete 组就是同一类 UAF;册页仍立即拆掉(按死亡指针做键,不能留);④ 契约定稿:C2 修订、C3 改写为"两个粒度必须匹配坐标作废范围"、§1.1 表补两行并把调用时机写成"**`end` 之后**"(作废发生在 end 不是 begin)。**新增回归**:`unit_tests` **T25**(`closeMembership` 纯函数:空输入/已闭合/单壳/宿主只剩空壳/多层依赖 —— 最后一条是"改成单轮过滤"的红靶子);`probe_review` **P4**(两段判据:P4a 不得越窗回收、P4b reset 通道必须"既释放又作废坐标")。**分辨力**:修复前 P4 CONFIRMED,修复后 P4a/P4b 皆 OK;T25 的 ④ 在单轮实现下必红 | `[实测]` P4 修复前 `retired 1→0 & held.isValid=1`(CONFIRMED)、修复后 `retired 1→1`(残留留着)与 reset 后 `retired=0 & held.isValid=0`;七目标 × 双配置 exit 全 0、0 错误 0 警告;`unit_tests` **25 块** × 双配置;interactive 66 [OK];bench 全模式 × 双配置 `CHECK=0`;probe **0 confirmed** |

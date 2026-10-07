@@ -184,16 +184,24 @@ public:
      * @param [in] row 投影行号(死前取自 rowOf)
      */
     void beginRowRemoval(GuiBase* par, int row) {
+        m_retiredAtWindowStart = m_src.retiredCount();   // ★ 记水位(见 endRowRemoval)
         beginRemoveRows(indexForParent(par), row, row);
     }
 
     /**
-     * @brief 精准删除结束:endRemoveRows 后自动 collectGarbage() ——
-     *        被删行(含随之蒸发的组行)的 persistent index 已失效,此时回收安全
+     * @brief 精准删除结束:endRemoveRows 后回收【本窗口新退役的】组
+     *
+     * ⚠ 这里【不能】用整队列的 `collectGarbage()`(2026-10-07 探针 P4 实证):
+     *   `endRemoveRows()` 只作废**本次信号覆盖的那个 parent 下 [first,last] 行**的
+     *   persistent index,而队列里可能还有更早入队的组 —— 它们的淘汰发生在【纯读】里
+     *   (childCount 触发重算时组蒸发),**没有任何信号覆盖过它们的行**。
+     *   整队列释放 = 视图仍持有"有效"的 index、而其 internalPointer 已悬空 → UAF。
+     *   所以:本窗口新退役的(坐标已被本次信号作废)当场回收,更早的留给下一次
+     *   reset 通道(那时 Qt 作废【全部】坐标,整队列释放才安全)。
      */
     void endRowRemoval() {
         endRemoveRows();
-        m_src.collectGarbage();
+        m_src.collectGarbageSince(m_retiredAtWindowStart);
     }
 
 private:
@@ -212,6 +220,10 @@ private:
     // m_labeler:节点 → 显示文本的注入函数(展示口味与引擎解耦)。
     //   写:setLabeler;读:data(DisplayRole)。不注入则显示 "?"。
     std::function<QString(GuiBase*)> m_labeler;
+    // m_retiredAtWindowStart:beginRowRemoval 时的退役队列水位。
+    //   removeRows 通道只作废它覆盖的行范围,所以 endRowRemoval 只能回收
+    //   [本水位, ·) 这一段 —— 更早入队的组其坐标没被任何信号作废(见 endRowRemoval 注释)。
+    size_t m_retiredAtWindowStart = 0;
 };
 
 // ════════════════════════════════════════════════════════════════

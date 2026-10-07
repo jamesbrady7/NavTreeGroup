@@ -56,13 +56,33 @@ public:
     //   QPersistentModelIndex.internalPointer 持有的展示节点。
     //   ★ 模型【不】该有任何投影写权限(见文件头),但"坐标失效后回收资源"
     //     是模型层的职责,所以这一条进窄接口 —— 它不改变任何投影内容。
-    //   ★ 调用契约:必须在 begin/endResetModel 或 begin/endRemoveRows 之内。
+    //   ★ 调用契约:必须在 begin/endResetModel 或 begin/endRemoveRows 之内,
+    //     **且要等 end 调用之后**(坐标作废发生在 end,不是 begin)。
     //     NavTreeModel 的 endFullReset / endRowRemoval 已自动调用,
     //     所以走这两条通道的调用方零心智负担。
     /**
      * @brief 释放引擎已淘汰、延迟待回收的展示节点(唯一安全释放点,契约 C3)
+     * @note 只有在 reset 通道内才安全:endResetModel 作废【全部】persistent index。
+     *       removeRows 通道请改用 collectGarbageSince(见下)。
      */
     virtual void collectGarbage() = 0;
+
+    // ── 回收的两个粒度(2026-10-07 探针 P4 实证后拆分)──────────────
+    // ★ 为什么不能一律整队列释放:两条通道的"作废范围"不一样 ——
+    //   · endResetModel() 作废【全部】persistent index ⇒ 整队列释放安全;
+    //   · endRemoveRows() 只作废【该 parent 下 [first,last] 行】 ⇒ 队列里
+    //     更早入队的组(淘汰发生在【纯读】里、没有任何信号覆盖过它的行)
+    //     仍然被 Qt 认为"有效",释放它们 = 视图持有悬空 internalPointer。
+    //   P4 实测:整体 collectGarbage() 之后,视图侧 held.isValid() 仍为 true。
+    /**
+     * @brief 当前退役队列水位(beginRowRemoval 时取,传给 collectGarbageSince)
+     */
+    virtual size_t retiredCount() const = 0;
+    /**
+     * @brief 只释放 waterMark 之后入队的退役组(removeRows 通道专用)
+     * @param [in] waterMark 窗口开始时的退役队列水位
+     */
+    virtual void collectGarbageSince(size_t waterMark) = 0;
 
     // ── 结构版本号:用于【检测视图与引擎是否失步】──────────────
     // 惰性投影的固有事实:一次纯读(childCount == rowCount)也可能让树的

@@ -19,6 +19,8 @@
 #include <vector>
 #include "guibase.h"
 #include "treeprojection.h"
+#include "navtreemodel.h"   // ★ P4 需要 NavTreeModel + QPersistentModelIndex
+                            //   (QAbstractItemModel 在 QtCore 里,本目标只链 Core 也够)
 
 static TreeProjection& P = TreeProjection::instance();
 static int g_confirmed = 0;
@@ -163,11 +165,116 @@ static void probe3() {
     delete root;
 }
 
+// ── P4:退役组被回收之后,视图可能仍持有它的 persistent index ──────────
+//  C1 的防线是这样的:组的淘汰可能发生在【读】里(childCount == rowCount,
+//  模型每次展开都会调),那一刻没有任何 begin/end 括号、引擎也没资格发信号
+//  ⇒ 当场 delete 就是 UAF ⇒ 于是只入 m_retired,等某个括号的 end 之后释放。
+//
+//  本探针检验这条防线在【"通知了、但没开括号" + "事后一个不相干的括号"】这条
+//  路径上是否仍然成立。注意这不是"漏通知"违约:`notifyRemove` 本身不要求括号
+//  (§1.1 的调用前提是"其余无"),守约调用方完全可能这么写。
+//
+//  判据(安全,【不】解引用):complete 一次释放后 held.isValid() 是否仍为 true。
+//  仍为 true ⇒ Qt 从没被告知过这个组没了,而它持有的 internalPointer 已经是
+//  被 delete 掉的对象 ⇒ 之后任何一次 rowCount(held)/展开态检查都是 UAF。
+static void probe4() {
+    printf("== P4 retired group vs view-held persistent index ==\n");
+    auto* root = new ProbeNode(nullptr, "R4");
+    auto* a    = new ProbeNode(root, "A", "Steel");
+    new ProbeNode(root, "B", "Alum");
+    new ProbeNode(root, "C", "Copper");
+    auto* d    = new ProbeNode(root, "D", "Copper");   // Copper 有两个成员:删一个不蒸发
+    P.registerRoot(root);
+    P.install(root, matSpec(), {});
+
+    NavTreeModel model(root, P);
+    model.setLabeler([](GuiBase* x) { return QString::fromStdString(x ? x->type() : "?"); });
+
+    // 视图"抱着"Steel 组 —— 等价于 QTreeView 把展开过的组放进 expandedIndexes
+    // (这正是 C1 自己写的前提:"视图对每个展开的组持有 QPersistentModelIndex")。
+    GuiBase* steelGroup = nullptr;
+    for (size_t i = 0; i < P.childCount(root); ++i) {
+        auto* g = dynamic_cast<TreeGroup*>(P.child(root, i));
+        if (g && g->ticket().key == "Steel") { steelGroup = g; break; }
+    }
+    if (!steelGroup) {
+        printf("  [SKIP] P4: Steel 组没建出来(前置不成立,本次测量无效)\n");
+        P.uninstall(root); P.unregisterRoot(root); P.collectGarbage(); delete root;
+        return;
+    }
+    QPersistentModelIndex held(model.indexFor(steelGroup));
+    printf("  held: Steel group @row %d, isValid=%d\n", held.row(), (int)held.isValid());
+
+    // ① 守约通知,但【不开任何括号】:Steel 组唯一的成员 A 没了
+    P.notifyRemove(root, a);
+    root->removeTreeChild(a);
+    delete a;
+    (void)model.rowCount(QModelIndex());          // 纯读 → 重算 → Steel 组蒸发 → 入 m_retired
+    const size_t retiredAfterEvaporate = P.retiredCount();
+    printf("  after bracket-less notifyRemove + read: retired=%zu, held.isValid=%d\n",
+           retiredAfterEvaporate, (int)held.isValid());
+
+    // 前提自检:① 确实发生过蒸发(入队了);② 入队时 Qt 仍认为 held 有效 ——
+    //   后者是 C1 的立论前提("视图抱着它、而引擎不知道")。两条缺一 = 本次测量无效。
+    if (retiredAfterEvaporate == 0 || !held.isValid()) {
+        printf("  [SKIP] P4: 前提不成立(retired=%zu / held.isValid=%d) —— 本次测量无效\n",
+               retiredAfterEvaporate, (int)held.isValid());
+        P.uninstall(root); P.unregisterRoot(root); P.collectGarbage(); delete root;
+        return;
+    }
+
+    // ② 一次【不相干】的精准删除(Copper 还剩 C,不蒸发),走标准 removeRows 括号。
+    //    ★ 期望:更早那个"无信号覆盖"的残留【不得】被释放 —— 队列水位停在 1。
+    //    修复前这里会 drop 到 0(整队列被兑现)→ 组被 delete 而 held 仍有效 → UAF。
+    GuiBase* copperGroup = P.parentOf(d);
+    const int dRow = P.rowOf(d);
+    model.beginRowRemoval(copperGroup, dRow);
+    P.notifyRemove(root, d);
+    root->removeTreeChild(d);
+    delete d;
+    model.endRowRemoval();
+    const size_t retiredAfterRowChannel = P.retiredCount();
+    printf("  after unrelated removeRows window: retired=%zu(期望仍为 %zu:更早的残留必须留着), held.isValid=%d\n",
+           retiredAfterRowChannel, retiredAfterEvaporate, (int)held.isValid());
+    const bool rowChannelSafe = (retiredAfterRowChannel == retiredAfterEvaporate);
+    if (!rowChannelSafe) {
+        printf("  [CONFIRMED] P4a: removeRows 通道释放了【未被本次信号覆盖】的残留组\n");
+        printf("                 (它已 delete,而 held 仍有效 ⇒ internalPointer 悬空)\n");
+        ++g_confirmed;
+    } else {
+        printf("  [OK] P4a: removeRows 通道只回收本窗口新退役的,更早残留留给 reset 通道\n");
+    }
+
+    // ③ 换 reset 通道兑现整队列 —— 这条路的判据要两条同时成立:
+    //    「队列确实清空(retired==0,组真的被释放了)」且「Qt 已作废该 index」。
+    //    两者同时成立才叫"既释放又不悬空";只满足前一半 = 复盘 ② 的洞。
+    model.beginFullReset();                       // 只为拿一个"作废全部坐标"的括号
+    model.endFullReset();                         // endResetModel(全部作废) + collectGarbage(整队列)
+    const size_t retiredAfterReset = P.retiredCount();
+    printf("  after reset channel: retired=%zu(期望 0), held.isValid=%d(期望 0)\n",
+           retiredAfterReset, (int)held.isValid());
+    if (retiredAfterReset != 0) {
+        printf("  [CONFIRMED] P4b: reset 通道没有清空队列\n");
+        ++g_confirmed;
+    } else if (held.isValid()) {
+        printf("  [CONFIRMED] P4b: 组已释放而 Qt 仍认为该 index 有效(internalPointer 悬空)\n");
+        ++g_confirmed;
+    } else {
+        printf("  [OK] P4b: reset 通道既释放了组、又已作废其坐标(释放点与坐标失效同窗)\n");
+    }
+
+    P.uninstall(root);
+    P.unregisterRoot(root);
+    P.collectGarbage();
+    delete root;
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     probe1();
     probe2();
     probe3();
+    probe4();
     printf("== summary: %d confirmed ==\n", g_confirmed);
     {   // 清场:挂探针根再 prune(m_roots 为空时 prune 直接 return,清不掉僵尸)
         ProbeNode probe(nullptr, "__purge__");
