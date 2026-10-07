@@ -1,0 +1,42 @@
+#pragma once
+// ═══════════════════════════════════════════════════════════════
+//  覆盖率专用:QObject 的最小替身(coverage-only stub)
+// ═══════════════════════════════════════════════════════════════
+//  用途:让【引擎 + 三政体】的代码能在没有 Qt 运行库的编译器下编译并做行覆盖率。
+//  做法:把这个目录放在 g++ 的 -I 列表【最前面】,于是 `guibase.h` 里的
+//        `#include <QObject>` 解析到本文件 —— **交付代码一行都不用改**
+//        (guibase.h 是冻结架构文件,不允许为了测覆盖率去动它)。
+//
+//  ⚠ 边界(必须知道):
+//    · 只提供 guibase.h / demonodes.h 实际用到的那几个成员:
+//        构造(QObject* parent)、parent()、children()、虚析构(让它多态,供 dynamic_cast)。
+//    · 【不是】Qt 的替代品,不能用于任何真实 Qt 代码;覆盖率构建里
+//        模型层(navtreemodel.h)与 4 个模型测试块(T15/T16/T18/T19)被
+//        `NT_ENGINE_ONLY` 排除,所以也用不到它们。
+//    · 语义差异:真实 QObject 的父子关系由 Qt 维护;这里是"构造时记下 parent"
+//        的最小模拟 —— 对"引擎只消费虚接口枚举"这件事没有影响。
+#include <vector>
+
+class QObject {
+public:
+    // ★ 必须模拟 Qt 的两条语义,否则三政体里的 QObject 政体行为就变了:
+    //   ① parenting:构造时把自己挂进 parent 的 children(GeomObject 的
+    //      parentForTree() 回退就是 `dynamic_cast<GuiBase*>(QObject::parent())`,
+    //      NamedGeom 的枚举则来自 children());
+    //   ② 连坐析构:~QObject 删掉自己的孩子(与 ~GuiBase 的连坐并列,两者互不重叠
+    //      —— 规范用法要求 QObject 政体的孩子【绝不】同时进 m_children)。
+    explicit QObject(QObject* parent = nullptr) : m_parent(parent) {
+        if (parent) parent->m_children.push_back(this);
+    }
+    virtual ~QObject() {                       // 多态:dynamic_cast<GuiBase*>(QObject*) 需要
+        for (QObject* child : m_children) delete child;   // 连坐(语义同 Qt)
+    }
+
+    QObject* parent() const { return m_parent; }
+    std::vector<QObject*> children() const { return m_children; }   // ★ 返回【值】而非引用:
+                                                                    //   调用点都是 range-for,值语义足够
+
+private:
+    QObject* m_parent = nullptr;
+    std::vector<QObject*> m_children;
+};

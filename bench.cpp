@@ -4,15 +4,21 @@
 //  目标:回答"这套惰性投影方案能不能扛住生产环境的百万节点"。
 //
 //  用法:
-//    bench.exe            跑全部常规场景(build/cold/hot/query/model/
-//                         incremental/rebuild/wide/prune/install-loop)
-//    bench.exe deep       深链场景单跑(递归深度风险,可能崩,单独进程隔离)
-//    bench.exe <名字>     单跑某场景
+//    bench.exe            跑全部常规场景(build/cold/hot/query/model/incremental/
+//                         rebuild/wide/prune/install-loop/regroup/gcstress/mem)
+//                         —— 【快档】规模,整套墙钟 < ~5 s(回归/CI 用)
+//    bench.exe full       同上,但切到 §3 性能基线的【原规模】
+//                         (1,010,101 节点;复现文档里的绝对读数用,墙钟 ~1 min)
+//    bench.exe full,mem   原规模 + 只跑 mem(逗号分隔:任何场景前都可加 full)
+//    bench.exe deep       深链场景单跑(递归深度风险 + 10 万级,单独进程隔离)
+//    bench.exe dbg        微型复现场景(自足)
+//    bench.exe <名字>     单跑某场景(依赖账本者需带 cold 前缀,见 main 的注释)
 //
 //  树形状(贴近 CAD 装配树):
-//    Shape A 层级树:root → 100 装配(A###) → 100 零件(P###) → 100 特征(F######)
-//                   共 1,010,101 节点;投影装在 A 层与 P 层(按材料 10 类分组)
-//    Shape B 宽树:  单父 200,000 直属孩子(压 bucketByKey/rowOf/firstVis)
+//    Shape A 层级树:root → N 装配(A###) → N 零件(P###) → N 特征(F######)
+//                   规模由 g_scale 决定(快档 / full 档);投影装在 A 层与 P 层
+//                   (按材料 10 类分组)
+//    Shape B 宽树:  单父 N 个直属孩子(压 bucketByKey/rowOf/firstVis)
 //    Shape C 深链:  100,000 级链(压 DFS 递归深度,deep 场景单跑)
 //
 //  政体:全部 BenchNode = m_children 连坐政体(最简;政体差异被虚接口吸收,
@@ -103,8 +109,37 @@ static void bench(const char* name, long long ops, F&& f) {
     fflush(stdout);
 }
 
-// ── Shape A:层级树 root → 100A → 100P → 100F = 1,010,101 节点 ──
-static const int NA = 100, NP = 100, NF = 100;   // 装配×零件×特征
+// ══ 规模档位(2026-10-07 release 分支引入)══════════════════════════════
+// 为什么要分档:本文件原来固定跑"1,010,101 节点"的原规模 —— 它把整套回归的
+// 墙钟拖到 Release 58 s / Debug 321 s(实测),而绝大多数 CHECK 只依赖【形状】,
+// 不依赖绝对规模。于是拆两档:
+//   · 默认(快档):回归/CI 用 —— 形状完全不变,规模缩小,总墙钟 < ~5 s;
+//   · `bench full`(或 `full,<场景>`):§3 性能基线的【原规模】,
+//     复现文档里的绝对读数(账本 108.6 MB / 10 万组 / 9.2 MB 峰值 …)。
+// ⚠ 两档都跑同一份代码、同一套断言 —— 所以断言里【不许写死节点数】,
+//   一律用 g_scale 派生量(节点数/页数/内部节点数)。写死了换档即红。
+// ⚠ 与 docs/PROJECT.md §3 的关系:表里所有绝对读数都出自 `full` 档;
+//   快档只会打印按比例缩小的账本条目数,不要拿去对文档。
+struct BenchScale {
+    int assy, part, feat;                 // Shape A:装配 × 零件 × 特征
+    int wideChildren;                     // Shape B:单父直属孩子数
+    int hotRounds;                        // rowcount 缓存命中循环次数
+    int queryOps;                         // parentOf/rowOf 随机查询次数
+    int lookupOps;                        // std::map vs unordered_map 对照次数
+    long long nodes() const {             // Shape A 节点总数
+        return 1LL + assy + (long long)assy * part
+                    + (long long)assy * part * feat;
+    }
+    size_t internals() const { return (size_t)assy + (size_t)assy * part; }
+    // 每页(P/A 层)按材料分 10 组 → 活组期望数
+    size_t expectGroups() const { return (size_t)assy * part * 10; }
+};
+static const BenchScale kFastScale = { 10, 10,  50,  20000,  2000,  20000,  200000 };
+static const BenchScale kFullScale = { 100, 100, 100, 200000, 20000, 100000, 1000000 };
+static BenchScale g_scale = kFastScale;
+static bool g_fullScale = false;          // 只为打印档位标签
+
+// ── Shape A:层级树 root → assy*A → part*P → feat*F ──
 static const char* MATERIALS[10] = {
     "Steel", "Alum", "Copper", "Plastic", "Rubber",
     "Glass", "Wood", "Titan", "Brass", "Ceramic"
@@ -117,15 +152,15 @@ struct ShapeA {
 static ShapeA g_tree;
 
 static void buildShapeA() {
-    bench("build-1M", 1010101, [] {
+    bench("build-shapeA", g_scale.nodes(), [] {
         g_tree.root = new BenchNode(nullptr, "ROOT");
-        for (int a = 0; a < NA; ++a) {
+        for (int a = 0; a < g_scale.assy; ++a) {
             auto* asmNode = new BenchNode(g_tree.root, "A" + std::to_string(a));
             g_tree.internals.push_back(asmNode);
-            for (int p = 0; p < NP; ++p) {
-                auto* part = new BenchNode(asmNode, "P" + std::to_string(a * NP + p));
+            for (int p = 0; p < g_scale.part; ++p) {
+                auto* part = new BenchNode(asmNode, "P" + std::to_string(a * g_scale.part + p));
                 g_tree.internals.push_back(part);
-                for (int f = 0; f < NF; ++f) {
+                for (int f = 0; f < g_scale.feat; ++f) {
                     // 叶子占采样即可,全存 vector 会吃 8MB 指针 —— 值得,查询场景要用
                     auto* leaf = new BenchNode(part, "F" + std::to_string(f),
                                                MATERIALS[(a + p + f) % 10]);
@@ -202,7 +237,7 @@ static void scenarioCold() {
            ms * 1e6 / (double)g_tree.internals.size());
     // 校验:活组数 = P 层数 × 10(A 层孩子是 P,material 为空 → byKey 出不了票,
     // A 层 0 组是正确行为,不是丢组)
-    size_t expect = (size_t)NA * NP * 10;
+    size_t expect = g_scale.expectGroups();
     size_t got = P.liveGroupCount();
 checkOk(got == expect, "liveGroupCount = %zu (expect %zu)", got, expect);
     fflush(stdout);
@@ -212,7 +247,7 @@ checkOk(got == expect, "liveGroupCount = %zu (expect %zu)", got, expect);
 static void scenarioHot() {
     if (!requireBoundShapeA("hot")) return;   // ★ 见 requireBoundShapeA 的注
     std::mt19937 rng(42);
-    const int ROUNDS = 20000;
+    const int ROUNDS = g_scale.hotRounds;
     bench("rowcount-cache-hit", ROUNDS, [&] {
         for (int i = 0; i < ROUNDS; ++i) {
             GuiBase* n = g_tree.internals[rng() % g_tree.internals.size()];
@@ -265,7 +300,7 @@ static void scenarioMemAndRates() { scenarioMem(); }
 static void scenarioQuery() {
     if (!requireBoundShapeA("query")) return;   // ★ 组内定位是本场景的测点,必须先有组
     std::mt19937 rng(7);
-    const int N = 100000;
+    const int N = g_scale.queryOps;
     bench("parentOf+rowOf", N, [&] {
         for (int i = 0; i < N; ++i) {
             GuiBase* leaf = g_tree.leaves[rng() % g_tree.leaves.size()];
@@ -303,12 +338,12 @@ static void scenarioQuery() {
         // 查表结构对照:10k 键(引擎账本页数)下 std::map vs unordered_map 的随机查找
         // 这是引擎选型的依据 —— 红黑树每级一次可能 cache miss 的指针追逐。
         std::vector<GuiBase*> keys;
-        keys.reserve(10100);
+        keys.reserve(g_tree.internals.size());
         for (GuiBase* n : g_tree.internals) keys.push_back(n);
         std::map<void*, int> mp; std::unordered_map<void*, int> um;
         for (size_t i = 0; i < keys.size(); ++i) { mp[keys[i]] = (int)i; um[keys[i]] = (int)i; }
         std::mt19937 r4(9); volatile int sink = 0;
-        const int M = 1000000;
+        const int M = g_scale.lookupOps;
         QElapsedTimer t; t.start();
         for (int i = 0; i < M; ++i) sink += mp.find(keys[r4() % keys.size()])->second;
         double msMap = (double)t.nsecsElapsed() / 1e6;
@@ -327,7 +362,7 @@ static void scenarioModel() {
     if (!requireBoundShapeA("model")) return;   // ★ CHECK 断言 visited > 原始节点数,靠分组才成立
     NavTreeModel model(g_tree.root, P);
     long long visited = 0;
-    bench("model-full-dfs", 1010101, [&] {
+    bench("model-full-dfs", g_scale.nodes(), [&] {
         // 显式栈 DFS(递归 1M 层会爆栈,视图本身也是逐层拉)
         std::vector<QModelIndex> stack;
         stack.push_back(QModelIndex());   // 不可见根
@@ -345,7 +380,7 @@ static void scenarioModel() {
             }
         }
     });
-    checkOk(visited > 1010101, "model dfs visited = %lld (投影后应 > 原始节点数,含组)", visited);
+    checkOk(visited > g_scale.nodes(), "model dfs visited = %lld (投影后应 > 原始节点数 %lld,含组)", visited, g_scale.nodes());
     fflush(stdout);
 }
 
@@ -406,7 +441,7 @@ static void scenarioRebuild() {
     long long rebuilt = 0;
     for (BenchNode* n : g_tree.internals) {
         if (n->name()[0] != 'P') continue;
-        for (int f = 0; f < NF; ++f) {
+        for (int f = 0; f < g_scale.feat; ++f) {
             // ⚠ 曾错写 (rebuilt+f)%10:rebuilt 每叶自增,与 f 叠加 → 材料索引步进 2
             //   → 只命中 5 种偶数位材料,引擎被冤枉组出 5 组/P(bench 自己的 bug)
             new BenchNode(n, "F" + std::to_string(f), MATERIALS[f % 10]);
@@ -433,7 +468,7 @@ static void scenarioRebuild() {
     printf("[BENCH] %-22s wipe %7.1f + rebuild %7.1f + prune冷 %7.1f + walk %7.1f = %8.1f ms (%lld leaves)\n",
            "rebuild-channel", wipeMs, rebuildMs, pruneColdMs, walkMs, chanMs, rebuilt);
 
-    size_t expect = (size_t)NA * NP * 10;   // 只有 P 层出组(A 层孩子无材料)
+    size_t expect = g_scale.expectGroups();   // 只有 P 层出组(A 层孩子无材料)
 checkOk(P.liveGroupCount() == expect, "after rebuild liveGroupCount = %zu (expect %zu)",
            P.liveGroupCount(), expect);
     // ── 全尺度探针:P 层逐节点体检(此时缓存新鲜,childCount 只读) ──
@@ -475,7 +510,7 @@ checkOk(P.liveGroupCount() == expect, "after rebuild liveGroupCount = %zu (expec
 
 // Shape B:宽树 —— 单父 200k 孩子,100 类材料(压分桶/落位/rowOf)
 static void scenarioWide() {
-    const int NW = 200000, KW = 100;
+    const int NW = g_scale.wideChildren, KW = 100;
     auto* wroot = new BenchNode(nullptr, "WROOT");
     for (int i = 0; i < NW; ++i)
         new BenchNode(wroot, "W" + std::to_string(i), "M" + std::to_string(i % KW));
@@ -567,13 +602,13 @@ static void scenarioRegroup() {
            "  └ collectGarbage", gcMs, P.retiredCount(), P.liveGroupCount());
     checkOk(P.retiredCount() == 0, "regroup 后待回收队列已清空 (retired=%zu)", P.retiredCount());
 
-    // 恢复材料规则,让后续场景看到与 build-1M 一致的形态
+    // 恢复材料规则,让后续场景看到与 buildShapeA 一致的形态
     P.resetRetiredHighWater();
     bindShapeA();       // 复用原定义:同 id 覆盖 → 全树回到按材料分组
     P.collectGarbage();
-checkOk(P.liveGroupCount() == (size_t)NA * NP * 10,
+checkOk(P.liveGroupCount() == g_scale.expectGroups(),
            "规则已恢复为按材料, liveGroupCount = %zu (expect %zu)",
-           P.liveGroupCount(), (size_t)NA * NP * 10);
+           P.liveGroupCount(), g_scale.expectGroups());
     fflush(stdout);
 }
 
@@ -686,7 +721,7 @@ static void scenarioPrune() {
     // ★ 最隐蔽的一个:账本空时 prune 无事可做 → 0.0 ns/op,而 exit 仍是 0。
     //   "数字看起来合理"比"明显错"更难发现,所以必须有前置。
     if (!requireBoundShapeA("prune")) return;
-    bench("prune-1M", 1010101, [&] { P.prune(); });
+    bench("prune-tree", g_scale.nodes(), [&] { P.prune(); });
 }
 
 // prune 的成本归因(常驻诊断,需账本非空 → 与 cold 串跑或用 `bench pbreak`)。
@@ -938,14 +973,36 @@ int main(int argc, char** argv) {
     if (arg == "deep") return scenarioDeep();
     if (arg == "dbg")  return scenarioDbg();
 
+    // ★ "full" 是【规模开关】不是场景名:出现即切到 §3 的原规模,并从场景串里摘掉。
+    //   "full" → all;"full,mem" / "mem,full" → mem。
+    if (arg.find("full") != std::string::npos) {
+        g_scale = kFullScale;
+        g_fullScale = true;
+        std::string rest;
+        size_t pos = 0;
+        while (pos <= arg.size()) {
+            const size_t comma = arg.find(',', pos);
+            const std::string piece = arg.substr(
+                pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            if (!piece.empty() && piece != "full") {
+                rest += (rest.empty() ? "" : ",") + piece;
+            }
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+        }
+        arg = rest.empty() ? "all" : rest;
+    }
+
     // 逗号分隔的场景串(二分定位污染用):如 "cold,rebuild"
     auto wants = [&](const char* name) {
         if (arg == "all") return true;
         return arg.find(name) != std::string::npos;
     };
 
-    printf("== TreeProjection bench · Release 数据才有意义 · WS 起点 %.0f MB ==\n",
-           workingSetMB());
+    printf("== TreeProjection bench · Release 数据才有意义 · 规模档=%s"
+           "(ShapeA %lld 节点 / %zu 页) · WS 起点 %.0f MB ==\n",
+           g_fullScale ? "full" : "fast",
+           g_scale.nodes(), g_scale.internals(), workingSetMB());
 
     // 只有单跑 wide(自带树)时才不建 Shape A;all/其它场景都要先建树
     if (arg == "all" || arg.find("wide") == std::string::npos) buildShapeA();

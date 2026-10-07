@@ -1,13 +1,15 @@
 // ═══════════════════════════════════════════════════════════════
 //  unit_tests:把流程切成 16 块,每块打印【职责 → 输入 → 输出 → 校验】
 // ═══════════════════════════════════════════════════════════════
-//  T1 ~T6  流水线纯函数(pipeline.h)—— 不碰引擎,裸输入裸输出
+//  T1 ~T6  流水线纯函数(projection_stages.h)—— 不碰引擎,裸输入裸输出
 //  T7 ~T12 引擎行为:端到端投影/缓存/组复用/坐标/蒸发/多层
 //  T13~T14 生命周期卫生:prune 剪僵尸 / bindSpec 跨重建重生
 //  T15~T16 模型层:三要素自洽 / 事前坐标信号协议
 //  运行:unit_tests.exe(仅 Qt Core,无窗口);退出码 = 失败块数
+#ifndef NT_ENGINE_ONLY
 #include <QAbstractItemModel>
 #include <QAbstractItemModelTester>   // T18:Qt 官方模型协议测试器(QtTest 模块)
+#endif
 #include <cstdio>
 #include <cstdint>
 #include <chrono>        // T21:宽节点读侧性能下限
@@ -20,8 +22,10 @@
 #endif
 #include "guibase.h"
 #include "treeprojection.h"
-#include "pipeline.h"
-#include "navtreemodel.h"
+#include "projection_stages.h"
+#ifndef NT_ENGINE_ONLY
+#include "navtreemodel.h"          // 覆盖率构建(NT_ENGINE_ONLY)下不需要 Qt 模型层
+#endif
 #include "demonodes.h"
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -133,24 +137,24 @@ static ProjectionSpec stdSpec() {
 // ═══════════════ T1~T6:流水线纯函数 ═══════════════
 
 static void t1_filter() {
-    hdr("T1", "Pipeline::filterLive", "Stage A 过滤 —— filter 为 false 的节点移出投影");
+    hdr("T1", "ProjectionStages::filterLive", "Stage A 过滤 —— filter 为 false 的节点移出投影");
     World w = makeWorld(true);
     std::vector<GuiBase*> live = { w.base, w.boltA, w.boltB, w.cover, w.sketch };
-    auto vis = Pipeline::filterLive(live, notSuppressed());
+    auto vis = ProjectionStages::filterLive(live, notSuppressed());
     showIn("live = " + lst(live) + ",  filter = 非压制件");
     showOut("vis  = " + lst(vis));
     expectList(vis, { w.base, w.boltA, w.boltB, w.sketch }, "Cover(压制)被滤掉,其余保序");
-    auto all = Pipeline::filterLive(live, nullptr);
+    auto all = ProjectionStages::filterLive(live, nullptr);
     check(all.size() == live.size(), "filter 为空 = 全员通过");
     freeWorld(w);
 }
 
 static void t2_bucket() {
-    hdr("T2", "Pipeline::bucketByKey", "Stage B-1 分桶 —— 规则给票据,同 key 归一堆");
+    hdr("T2", "ProjectionStages::bucketByKey", "Stage B-1 分桶 —— 规则给票据,同 key 归一堆");
     World w = makeWorld(true);
     std::vector<GuiBase*> vis = { w.base, w.boltA, w.boltB, w.sketch };
     size_t participants = 0;
-    auto buckets = Pipeline::bucketByKey(vis, nullptr /*dynamicAll*/, byMaterial(), participants);
+    auto buckets = ProjectionStages::bucketByKey(vis, nullptr /*dynamicAll*/, byMaterial(), participants);
     showIn("vis = " + lst(vis) + ",  grouping = 按材料(Sketch 返回 nullopt)");
     std::string out;
     for (auto& b : buckets) {
@@ -168,20 +172,20 @@ static void t2_bucket() {
 }
 
 static void t3_collapse() {
-    hdr("T3", "Pipeline::shouldCollapse", "Stage B-2 单组塌缩 —— 全员同组时不建废层级");
+    hdr("T3", "ProjectionStages::shouldCollapse", "Stage B-2 单组塌缩 —— 全员同组时不建废层级");
     World w = makeWorld(false);
     // 情形① 全员进同一个桶(比如把所有 DataObject 归入 "All")
     GroupRule all = [](GuiBase*) { GroupTicket t; t.key = "All"; t.label = "All"; return t; };
     std::vector<GuiBase*> vis = { w.base, w.boltA, w.boltB, w.cover, w.sketch };
     size_t part = 0;
-    auto b1 = Pipeline::bucketByKey(vis, nullptr, all, part);
-    bool c1 = Pipeline::shouldCollapse(b1, part, vis.size(), { true, true });
+    auto b1 = ProjectionStages::bucketByKey(vis, nullptr, all, part);
+    bool c1 = ProjectionStages::shouldCollapse(b1, part, vis.size(), { true, true });
     showIn("vis 全员同 key, collapseIfSingleGroup=true");
     showOut(std::string("shouldCollapse = ") + (c1 ? "true" : "false"));
     check(c1, "全员一组 → 塌缩(组层级是废的)");
     // 情形② 有直属残余(Sketch 走逃生口)→ 不塌缩
-    auto b2 = Pipeline::bucketByKey(vis, nullptr, byMaterial(), part);
-    bool c2 = Pipeline::shouldCollapse(b2, part, vis.size(), { true, true });
+    auto b2 = ProjectionStages::bucketByKey(vis, nullptr, byMaterial(), part);
+    bool c2 = ProjectionStages::shouldCollapse(b2, part, vis.size(), { true, true });
     showIn("vis 分出 Steel/Alum 两桶 + Sketch 直属");
     showOut(std::string("shouldCollapse = ") + (c2 ? "true" : "false"));
     check(!c2, "多桶/有直属 → 不塌缩");
@@ -189,18 +193,18 @@ static void t3_collapse() {
 }
 
 static void t4_reuse() {
-    hdr("T4", "Pipeline::matchReusable", "Stage B-3 组复用匹配 —— 同 key 用旧组指针,落选的进淘汰名单");
+    hdr("T4", "ProjectionStages::matchReusable", "Stage B-3 组复用匹配 —— 同 key 用旧组指针,落选的进淘汰名单");
     // 旧组:Steel/Alum;新桶:Steel/Copper → Steel 复用,Alum 淘汰,Copper 新建
     GroupTicket ts; ts.key = "Steel"; ts.label = "Steel parts";
     GroupTicket ta; ta.key = "Alum";  ta.label = "Alum parts";
     auto* gSteel = new TreeGroup(ts, nullptr);
     auto* gAlum  = new TreeGroup(ta, nullptr);
     std::vector<TreeGroup*> old = { gSteel, gAlum };
-    std::vector<Pipeline::Bucket> buckets(2);
+    std::vector<ProjectionStages::Bucket> buckets(2);
     buckets[0].ticket = ts;
     buckets[1].ticket.key = "Copper"; buckets[1].ticket.label = "Copper parts";
     std::vector<TreeGroup*> culled;
-    auto reuse = Pipeline::matchReusable(buckets, old, culled);
+    auto reuse = ProjectionStages::matchReusable(buckets, old, culled);
     showIn("旧组 = [Steel@0x" + std::to_string((uintptr_t)gSteel) + ", Alum],  新桶 = [Steel, Copper]");
     showOut(std::string("reuse = [") + (reuse[0] == gSteel ? "Steel旧指针" : "?") + ", "
             + (reuse[1] ? "?" : "null(新建)") + "],  culled = ["
@@ -212,7 +216,7 @@ static void t4_reuse() {
 }
 
 static void t5_flat() {
-    hdr("T5", "Pipeline::buildFlat", "flat 落位 —— 直属原位不动,组落在首个成员的原位置");
+    hdr("T5", "ProjectionStages::buildFlat", "flat 落位 —— 直属原位不动,组落在首个成员的原位置");
     World w = makeWorld(false);
     auto* gS = new TreeGroup(GroupTicket{ "Steel", "Steel", 0 }, nullptr);
     auto* gA = new TreeGroup(GroupTicket{ "Alum", "Alum", 0 }, nullptr);
@@ -224,7 +228,7 @@ static void t5_flat() {
     entries[w.boltA]  = PosEntry{ gS, 1 };
     entries[w.boltB]  = PosEntry{ gA, 0 };
     entries[w.cover]  = PosEntry{ gA, 1 };
-    auto flat = Pipeline::buildFlat(vis, entries, w.root);
+    auto flat = ProjectionStages::buildFlat(vis, entries, w.root);
     showIn("vis = " + lst(vis) + ",  entries = {Base,BoltA→Steel; BoltB,Cover→Alum}");
     showOut("flat = " + lst(flat));
     expectList(flat, { gS, gA, w.sketch }, "5 个节点收敛成 3 行:两组各占首成员位置,Sketch 原位");
@@ -233,14 +237,14 @@ static void t5_flat() {
 }
 
 static void t6_sort() {
-    hdr("T6", "Pipeline::sortFlat / sortMembers", "Stage C 排序 —— 组前置,其余按类型秩+名字;stable 不抖动");
+    hdr("T6", "ProjectionStages::sortFlat / sortMembers", "Stage C 排序 —— 组前置,其余按类型秩+名字;stable 不抖动");
     World w = makeWorld(false);
     auto* gS = new TreeGroup(GroupTicket{ "Steel", "Steel", 0 }, nullptr);
     std::vector<GuiBase*> flat = { w.sketch, w.base, gS, w.boltA };
     std::map<TreeGroup*, std::vector<GuiBase*>> members = { { gS, { w.boltA, w.base } } };
     showIn("flat(落位后未排序) = " + lst(flat) + ",  组成员 = [BoltA, Base]");
-    Pipeline::sortMembers(members, demoLess);
-    Pipeline::sortFlat(flat, demoLess);
+    ProjectionStages::sortMembers(members, demoLess);
+    ProjectionStages::sortFlat(flat, demoLess);
     showOut("flat(排序后) = " + lst(flat) + ",  组成员(排序后) = " + lst(members[gS]));
     expectList(flat, { gS, w.base, w.boltA, w.sketch }, "组最前(秩-1),Part 按名字 Base<BoltA,Sketch 殿后");
     expectList(members[gS], { w.base, w.boltA }, "组内同一比较器排序");
@@ -461,8 +465,11 @@ static void t14_rebind() {
 
 // ═══════════════ T15~T16:模型层 ═══════════════
 
+#ifndef NT_ENGINE_ONLY
 static NavTreeModel* m15 = nullptr;   // 只给 t15 的递归 walk 用(避免 lambda 套娃传参)
+#endif
 
+#ifndef NT_ENGINE_ONLY
 static void t15_model() {
     int n = 0;
     bool ok = true;
@@ -491,7 +498,9 @@ static void t15_model() {
     P.uninstall(w.root);
     freeWorld(w);
 }
+#endif // !NT_ENGINE_ONLY
 
+#ifndef NT_ENGINE_ONLY
 static void t16_signals() {
     hdr("T16", "事前坐标删除协议", "死前问 parentOf/rowOf → begin → 删 → end;信号恰发一次,坐标是投影行号");
     World w = makeWorld(true);
@@ -537,6 +546,7 @@ static void t16_signals() {
     P.collectGarbage();
     freeWorld(w);
 }
+#endif // !NT_ENGINE_ONLY
 
 // ═══════════════ T17~T18:契约回归 + 模型协议 ═══════════════
 
@@ -615,6 +625,7 @@ static void t17_readSideRelease() {
 //        而且它【抓不到任何东西】:rowCount() 每次都重新问引擎拿真实结构,
 //        差值永远是真实减少量,和信号发没发对毫无关系(实测反例照样"通过")。
 //        要验证信号,就得看信号【本身】的参数。
+#ifndef NT_ENGINE_ONLY
 static void t18_modelProtocol() {
     hdr("T18", "模型协议(Tester)+ 信号坐标(rowsAboutToBeRemoved 参数)",
         "Tester 查模型账本自洽;信号参数断言查'发在哪一行'(Tester 查不了)");
@@ -714,6 +725,7 @@ static void t18_modelProtocol() {
     P.collectGarbage();
     freeWorld(w);
 }
+#endif // !NT_ENGINE_ONLY
 
 // T19:级联预判的多层覆盖(坑34 的专项回归)
 //   坑34 的失效形状是【多层】:"内层组蒸发 → 外层组也跟着空 → 外层也蒸发"。
@@ -726,6 +738,7 @@ static void t18_modelProtocol() {
 //     所以要分两步:先让数据节点成组(Inner),再让规则把"名为 Inner 的组"收进
 //     另一个桶(Outer)。且规则必须【只收 key==Inner 的组】,否则 Outer 会把自己
 //     也收进去 → 无限套娃(工厂规则无条件豁免组节点正是为了防这个)。
+#ifndef NT_ENGINE_ONLY
 static void t19_cascadeMultiLayer() {
     hdr("T19", "级联预判·多层(内层蒸发→外层也跟着空)",
         "两层嵌套下删最内层唯一成员:cascadeTarget 必须返回最外层组,且信号只发一条");
@@ -813,6 +826,7 @@ static void t19_cascadeMultiLayer() {
     P.collectGarbage();
     delete root;
 }
+#endif // !NT_ENGINE_ONLY
 
 // T21:宽节点读侧(防 O(k²) 回退)
 //   背景(2026-10-06):模型对每一行都问 parentOf/rowOf,而旧实现为了给出答案必须
@@ -903,6 +917,7 @@ static void t21_wideReadCost() {
 //   ③ _CrtSetReportMode 的首参是【单一报告类型】而非位掩码 —— 传
 //      (_CRT_ASSERT|_CRT_ERROR|...) 会让 CRT 反过来断言自己的参数,又弹一次。
 //   正确做法:逐类型设置 + SetErrorMode 禁系统弹框,报告写 stderr(下面重定向到文件)。
+#ifdef _MSC_VER
 static void silenceCrtDialogs() {
 #ifdef Q_OS_WIN
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
@@ -914,6 +929,7 @@ static void silenceCrtDialogs() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 #endif
 }
+#endif // _MSC_VER
 
 // T20(v4):漏通知的检测与自愈(paranoid + prune 两层兜底)
 //   v4 契约:数据变更后调用方【必须】通知(invalidate/notifyRemove);
@@ -1165,17 +1181,17 @@ static void t24_shellGroup() {
     delete root;
 }
 
-// T25:Pipeline::closeMembership 的纯函数测试(成员关系的闭包)
+// T25:ProjectionStages::closeMembership 的纯函数测试(成员关系的闭包)
 //   它是 Stage B-2b 的唯一实现,也是"空壳组"缺陷的正面对策 ——
-//   按工程约定(每个 pipeline 纯函数配"输入→输出"实例)单列一块。
+//   按工程约定(每个 ProjectionStages 纯函数配"输入→输出"实例)单列一块。
 //   四类边界:空输入 / 已闭合(不误杀) / 单壳(含"宿主只剩空壳") / 多层依赖(必须迭代收敛)。
 //   ★ 分辨力:第 ④ 条是给"把迭代改成单轮过滤"准备的红靶子 ——
 //     单轮实现会停在 A:[B](dropped=1、桶不退空),该断言立刻变红。
 //   ⚠ 纯函数纪律:它【不删】任何组对象,测试自己负责 delete。
 static void t25_closeMembership() {
-    hdr("T25", "Pipeline::closeMembership(成员关系闭包)",
+    hdr("T25", "ProjectionStages::closeMembership(成员关系闭包)",
         "剔除空壳组 + 丢掉随之变空的桶;空输入/已闭合/单壳/多层依赖四类边界");
-    using Pipeline::Bucket;
+    using ProjectionStages::Bucket;
 
     NamedData d1("D1"), d2("D2");              // 只当"不是组"的成员用,不接入任何树
 
@@ -1194,13 +1210,13 @@ static void t25_closeMembership() {
     // ① 空输入
     {
         std::vector<Bucket> buckets;
-        const size_t dropped = Pipeline::closeMembership(buckets);
+        const size_t dropped = ProjectionStages::closeMembership(buckets);
         check(dropped == 0 && buckets.empty(), "① 空输入:返回 0、保持空");
     }
     // ② 已闭合:成员全是数据节点 → 一个都不动(不误杀)
     {
         std::vector<Bucket> buckets = { makeBucket("A", { &d1, &d2 }) };
-        const size_t dropped = Pipeline::closeMembership(buckets);
+        const size_t dropped = ProjectionStages::closeMembership(buckets);
         check(dropped == 0 && buckets.size() == 1 && buckets[0].members.size() == 2,
               "② 已闭合:没有组成员 → 原样不动(dropped=0)");
     }
@@ -1208,7 +1224,7 @@ static void t25_closeMembership() {
     {
         TreeGroup* shell = makeGroup("Inner");
         std::vector<Bucket> buckets = { makeBucket("Outer", { shell, &d1 }) };
-        const size_t dropped = Pipeline::closeMembership(buckets);
+        const size_t dropped = ProjectionStages::closeMembership(buckets);
         check(dropped == 1 && buckets.size() == 1
               && buckets[0].members.size() == 1 && buckets[0].members[0] == &d1,
               "③ 单壳:空壳组被剔除、宿主桶保留其余成员(dropped=1)");
@@ -1218,7 +1234,7 @@ static void t25_closeMembership() {
     {
         TreeGroup* shell = makeGroup("Inner");
         std::vector<Bucket> buckets = { makeBucket("Outer", { shell }) };
-        const size_t dropped = Pipeline::closeMembership(buckets);
+        const size_t dropped = ProjectionStages::closeMembership(buckets);
         check(dropped == 1 && buckets.empty(), "③b 宿主只剩空壳:连桶一起丢掉");
         delete shell;
     }
@@ -1229,7 +1245,7 @@ static void t25_closeMembership() {
         TreeGroup* gB = makeGroup("B");
         TreeGroup* gC = makeGroup("C");
         std::vector<Bucket> buckets = { makeBucket("A", { gB }), makeBucket("B", { gC }) };
-        const size_t dropped = Pipeline::closeMembership(buckets);
+        const size_t dropped = ProjectionStages::closeMembership(buckets);
         showOut("多层依赖:dropped=" + std::to_string(dropped)
                 + " 剩余桶=" + std::to_string(buckets.size()) + "(期望 2 / 0)");
         check(dropped == 2 && buckets.empty(),
@@ -1238,20 +1254,401 @@ static void t25_closeMembership() {
     }
 }
 
+// T26:引擎公开 API 面的系统性覆盖 —— 通知族 / 写侧入口 / 读侧边界 / 回收粒度
+//   为什么单列(2026-10-07 引入行覆盖率测量后发现的):下面这些【交付给内网的公开
+//   API 与分支】在整个电池里从没被调用过,或只走了主路径、分支一次都没分叉:
+//     apply() / refresh() / install(nullptr) / 静态 pool(siblings) /
+//     invalidateNode() / invalidateAll() / markGroupPagesDirty 的传递分支 /
+//     collectGarbageSince() / healIfDrift 的三条闸门 + 等长内容漂移 /
+//     读侧四件套的空指针与"无页父亲"分支 / 宽亲(>256)槽位表 / 塌缩清桶。
+//   "没测到就等于没验证" —— 这些是接口面,不是内部实现细节。
+static void t26_apiSurface() {
+    hdr("T26", "引擎 API 面(通知族/写侧入口/读侧边界/回收粒度)",
+        "把电池从没碰过的公开接口与分支逐个走一遍");
+    using ProjectionStages::Bucket;
+
+    // ── ① 读侧四件套的边界:空指针 / 越界 / "无页父亲"(透传)──
+    {
+        auto* root = new NamedData("R26a");
+        auto* leaf = new PartObject("L", "M", root);
+        root->addSubDataGroup(leaf);
+        showIn("root 下 1 个零件,【不装投影】—— 读侧走透传分支");
+        check(P.childCount(nullptr) == 0 && P.child(nullptr, 0) == nullptr
+              && P.parentOf(nullptr) == nullptr && P.rowOf(nullptr) == -1,
+              "① 空指针边界:childCount=0 / child=nullptr / parentOf=nullptr / rowOf=-1");
+        check(P.child(root, 99) == nullptr, "① child 越界 → nullptr");
+        check(P.parentOf(leaf) == root && P.rowOf(leaf) == 0,
+              "① 无页父亲:parentOf 给自然父亲、rowOf 扫原始序列兜底(=0)");
+        P.invalidate(root);        // 无页 → 早返回(透传读永远新鲜)
+        P.invalidateNode(root);    // 同上
+        P.refresh(root);           // 无页 → 早返回
+        check(P.rowOf(leaf) == 0, "① 三个通知/刷新入口在'无页'上都是安全的空操作");
+        check(P.install(nullptr, ProjectionSpec{}).empty(), "① install(nullptr) 返回空表");
+        P.invalidate(nullptr); P.invalidateNode(nullptr); P.notifyRemove(nullptr, nullptr);
+        check(true, "① 全部通知入口的空指针守卫不崩");
+        P.unregisterRoot(root);
+        delete root;
+    }
+
+    // ── ② apply / refresh / structRev:一段真实页上的写侧入口 ──
+    {
+        auto* root = new NamedData("R26b");
+        auto* a = new PartObject("A", "Steel", root);
+        auto* b = new PartObject("B", "Alum", root);
+        auto* c = new PartObject("C", "Steel", root);
+        root->addSubDataGroup(a); root->addSubDataGroup(b); root->addSubDataGroup(c);
+        P.registerRoot(root);
+        auto rule = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        auto groups = P.apply(root, { a, b, c }, rule, { false, true });   // ③ apply 入口
+        check(groups.size() == 2 && P.hasProjection(root),
+              "② apply():按材料建出 2 个组(Steel/Alum)");
+        const size_t rev0 = P.structRev();
+        P.refresh(root);                                                  // ③ refresh 入口
+        check(P.structRev() == rev0, "② refresh() 幂等:重算同一 Spec 不改变形状版本号(structRev 不变)");
+        // 换规则 → 形状变 → structRev 必须递增(它是失步自检的判据)
+        auto one = [](GuiBase*) -> std::optional<GroupTicket> {
+            GroupTicket t; t.key = "All"; t.label = "All"; return t;
+        };
+        P.apply(root, { a, b, c }, one, { false, true });
+        check(P.structRev() > rev0, "② 换规则后 structRev 递增(形状真的变了)");
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        delete root;
+    }
+
+    // ── ③ 静态参与名单(pool / siblings):dynamicAll=false 的整条路 ──
+    {
+        auto* root = new NamedData("R26c");
+        auto* a = new PartObject("A", "Steel", root);
+        auto* b = new PartObject("B", "Steel", root);
+        auto* c = new PartObject("C", "Steel", root);
+        root->addSubDataGroup(a); root->addSubDataGroup(b); root->addSubDataGroup(c);
+        P.registerRoot(root);
+        auto rule = [](GuiBase*) -> std::optional<GroupTicket> {
+            GroupTicket t; t.key = "G"; t.label = "G"; return t;
+        };
+        // 名单只给 a、b:规则对 c 连问都不问
+        auto g1 = P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, false } }, { a, b });
+        check(g1.size() == 1 && P.childCount(g1[0]) == 2,
+              "③ pool 静态名单:a/b 进组、c 留直属(规则对名单外的节点不出票)");
+        check(P.parentOf(c) == root, "③ 名单外的 c 是直属");
+        // ★ 名单里塞【本父亲的旧组】→ 必须展开为它的当前活成员(否则换规则时组内成员全体失踪)
+        auto g2 = P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, false } },
+                            { g1[0] });   // 只给旧组,不给 a/b
+        check(g2.size() == 1 && P.childCount(g2[0]) == 2,
+              "③ siblings 传【旧组】时展开为它的活成员(a/b 没失踪)");
+        check(P.parentOf(c) == root, "③ 展开名单不影响名单外的节点");
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        delete root;
+    }
+
+    // ── ④ 通知族:invalidateNode(含组分支)/ invalidateAll / 传递置脏 ──
+    {
+        auto* root = new NamedData("R26d");
+        auto* folder = new FolderObject("F", root);
+        auto* m1 = new PartObject("M1", "Steel", folder);
+        auto* m2 = new PartObject("M2", "Alum", folder);
+        folder->addSubDataGroup(m1); folder->addSubDataGroup(m2);
+        root->addSubDataGroup(folder);
+        P.registerRoot(root);
+        auto rule = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        ProjectionSpec spec{ nullptr, rule, nullptr, { false, true } };
+        P.install(folder, spec, {});
+        P.install(root, spec, {});
+        TreeGroup* steel = findGroup(folder, "Steel");
+        check(steel != nullptr, "④ 前置:folder 页建出 Steel 组");
+        P.invalidateNode(m1);                       // ← 数据节点分支:经 parentForTree 找自然父
+        check(P.parentOf(m1) != nullptr, "④ invalidateNode(数据节点)不崩、投影仍可用");
+        P.invalidateNode(steel);                    // ← 组分支:走 owner()
+        check(P.parentOf(m1) != nullptr, "④ invalidateNode(组)走 owner() 分支,不崩");
+        P.invalidateAll();                          // ← 全量置脏
+        check(P.childCount(folder) == 2, "④ invalidateAll() 后逐页收敛,读数正确");
+        // 传递置脏:owner 变 → 名下"有自己页的组"连坐(给组也装一页)
+        P.install(steel, spec, {});
+        P.invalidate(folder);                       // markGroupPagesDirty 要遍历 steel 的页
+        check(P.childCount(steel) >= 0, "④ 给组装页后 invalidate(owner) 的传递置脏路径可跑");
+        P.uninstall(steel);
+        P.uninstall(folder);
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        delete root;
+    }
+
+    // ── ⑤ 回收粒度:collectGarbageSince 的两段(水位早退 / 只回收 watermark 之后)──
+    {
+        auto* root = new NamedData("R26e");
+        auto* k1 = new PartObject("K1", "M1", root);
+        auto* k2 = new PartObject("K2", "M2", root);
+        root->addSubDataGroup(k1); root->addSubDataGroup(k2);
+        P.registerRoot(root);
+        auto rule = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, true } }, {});
+        (void)P.childCount(root);
+        check(P.liveGroupCount() == 2, "⑤ 前置:两个组各一个成员");
+        check(!P.hasRetired() && P.retiredCount() == 0, "⑤ 前置:队列为空");
+        // 静默删掉两个成员(不开括号)→ 纯读触发蒸发 → 两个组进队列。
+        // ⚠ 这两个节点挂在 DataObject 政体的 m_subDataGroups 里,必须用
+        //   destroySubDataGroup 摘除+删除(removeTreeChild 只管 m_children,摘不掉它们)
+        root->destroySubDataGroup(k1);
+        root->destroySubDataGroup(k2);
+        P.invalidate(root);        // ★ 守约通知,但【不开任何 begin/end 括号】——
+                                   //   这正是 P4 探针钉住的那条路径。Release 下若不通知,
+                                   //   纯读只会答陈旧缓存(v4 契约),不会发生蒸发。
+        (void)P.childCount(root);
+        const size_t queued = P.retiredCount();
+        showOut("静默删光两个成员后: 活组=" + std::to_string(P.liveGroupCount())
+                + " 退役队列=" + std::to_string(queued) + "(期望活组0/队列2)");
+        check(queued == 2, "⑤ 两个组都进了退役队列(retiredCount=2)");
+        P.collectGarbageSince(queued);              // 水位 ≥ size → 早退
+        check(P.retiredCount() == queued, "⑤ collectGarbageSince(水位≥size)早退:一个都不回收");
+        P.collectGarbageSince(1);                   // 只回收 [1,·):留 1 个
+        check(P.retiredCount() == 1, "⑤ collectGarbageSince(1) 只回收 watermark 之后 → 剩 1");
+        P.collectGarbage();                          // 整队列
+        check(P.retiredCount() == 0, "⑤ collectGarbage() 清空整队列");
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        delete root;
+    }
+
+    // ── ⑥ 自愈闸门:healIfDrift 的早退 + "等长内容漂移"的逐元素比对 ──
+    {
+        auto* root = new NamedData("R26f");
+        auto* s1 = new PartObject("S1", "Steel", root);
+        auto* a1 = new PartObject("A1", "Alum", root);
+        root->addSubDataGroup(s1);
+        root->addSubDataGroup(a1);
+        P.registerRoot(root);
+        auto byMat = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        P.install(root, ProjectionSpec{ nullptr, byMat, nullptr, { false, true } }, {});
+        check(P.liveGroupCount() == 2, "⑥ 前置:Steel/Alum 两个组");
+        const bool oldParanoid = P.paranoidChecks();
+        P.setParanoidChecks(true);
+        // 闸门②(已知脏页):先通知再读 → healIfDrift 必须在 dirty 处早退(不然会误点名)
+        P.invalidate(root);
+        (void)P.childCount(root);
+        check(P.liveGroupCount() == 2, "⑥ 闸门②:已通知的脏页重算后仍是 2 组(早退且不误报)");
+        // ★ 等长内容漂移:静默"删一个 Steel + 加一个 Alum" ⇒ 孩子数不变、内容变了。
+        //   只比长度的探测会漏掉它 —— 必须逐元素比对才抓得到(那段循环存在的理由)。
+        root->destroySubDataGroup(s1);
+        auto* a2 = new PartObject("A2", "Alum", root);
+        root->addSubDataGroup(a2);
+        // ⚠ 判据要取【数据侧】:投影侧的 childCount 在被读到时已经自愈了(paranoid 是同步的)
+        check(root->visibleChildrenCount() == 2,
+              "⑥ 等长漂移:数据侧孩子数仍是 2 —— 只比长度的探测抓不到这种漂移");
+        // 纯观测不重算(liveGroupCount 只数账本,不触发 revalidate)——所以此刻仍是陈旧的 2 组
+        check(P.liveGroupCount() == 2,
+              "⑥ 陈旧态:未发生任何读之前,投影仍是 2 组(liveGroupCount 是纯观测,不触发重算)");
+        (void)P.childCount(root);      // ← 就是这一次读,触发 healIfDrift 的逐元素比对
+        check(P.liveGroupCount() == 1,
+              "★⑥ paranoid 逐元素比对发现等长漂移并自愈:Steel 组已蒸发(真的比了内容)");
+        P.setParanoidChecks(oldParanoid);
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        delete root;
+    }
+
+    // ── ⑦ 宽亲(>256):槽位查找切到哈希索引那一档 + 塌缩清桶 ──
+    {
+        auto* root = new NamedData("R26g");
+        const int WIDE = 300;                       // > 256 ⇒ useSlotMap 分支
+        std::vector<GuiBase*> kidsW;
+        for (int i = 0; i < WIDE; ++i) {
+            auto* k = new PartObject("W" + std::to_string(i), (i % 2) ? "A" : "B", root);
+            root->addSubDataGroup(k);
+            kidsW.push_back(k);
+        }
+        P.registerRoot(root);
+        auto rule = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, true } }, {});
+        // 第二次 install:这时 oldGroups 非空 → 走"按槽位插入 + 宽亲哈希索引"那一档
+        P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, true } }, {});
+        check(P.childCount(root) == 2, "⑦ 宽亲(300 孩子)分组后仍是 2 个组");
+        check(P.childCount(findGroup(root, "A")) + P.childCount(findGroup(root, "B")) == WIDE,
+              "⑦ 300 个成员一个不少(宽亲槽位表路径正确)");
+        // 塌缩清桶:全员同组 + collapseIfSingleGroup ⇒ 不建组(shouldCollapse 的 clear 分支)
+        auto all = [](GuiBase*) -> std::optional<GroupTicket> {
+            GroupTicket t; t.key = "All"; t.label = "All"; return t;
+        };
+        P.install(root, ProjectionSpec{ nullptr, all, nullptr, { true /*collapse*/, true } }, {});
+        check(P.liveGroupCount() == 0 && P.childCount(root) == WIDE,
+              "⑦ collapseIfSingleGroup:全员同组 → 清桶不建废层级(300 行直属)");
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        clearData(root);
+        delete root;
+    }
+}
+
+// T27:基础件的【直接】单测 —— PtrSet 全接口 + GuiBase 默认政体 + GeomObject
+//   为什么单列:这两个头文件是三政体与 prune DFS 的地基,但电池一直只"间接"用到它们:
+//     · PtrSet 只走了 insert 的"首次插入"路径 —— contains/clear/reserve/grow 全没碰过;
+//     · GuiBase 的【默认实现】(m_children 政体:addTreeChild/removeTreeChild/
+//       visibleChildrenCount/visibleChild/indexInParent/parentForTree)从没被执行过,
+//       因为测试用的节点全是 DataObject/DataObject+QObject 派生。
+//   地基没测到 = 上层结论的全部前提都没测到。
+static void t27_primitives() {
+    hdr("T27", "基础件直接单测(PtrSet 全接口 / GuiBase 默认政体 / GeomObject)",
+        "三政体与 prune DFS 的地基:键集容器 + 展示接口的默认实现");
+
+    // ── ① PtrSet:insert 去重 / contains / reserve / clear / grow ──
+    {
+        PtrSet s;
+        std::vector<int*> ptrs;
+        for (int i = 0; i < 200; ++i) ptrs.push_back(new int(i));   // 造 200 个不同地址
+        check(s.insert(ptrs[0]) && !s.insert(ptrs[0]) && s.size() == 1,
+              "① insert 返回 true=首次 / false=重复,size 不重复计数");
+        check(s.insert(nullptr) == false && s.size() == 1, "① nullptr 永不进表");
+        check(s.contains(ptrs[0]) && !s.contains(ptrs[1]), "① contains 命中/未命中");
+        check(!s.contains(nullptr), "① contains(nullptr) 恒 false");
+        s.reserve(1000);                            // ← reserve 入口
+        check(s.size() == 1 && s.contains(ptrs[0]), "① reserve 后内容不丢");
+        for (int i = 1; i < 200; ++i) s.insert(ptrs[i]);   // 触发 grow(负载 0.7)
+        check(s.size() == 200, "① 插满 200 个(grow 反复扩容后计数仍精确)");
+        bool allIn = true;
+        for (auto* p : ptrs) allIn = allIn && s.contains(p);
+        check(allIn, "① 扩容后 200 个键全部仍可命中(hash & 线性探测在 rehash 后正确)");
+        s.clear();                                  // ← clear 入口
+        check(s.size() == 0 && !s.contains(ptrs[0]), "① clear 后为空且键不可命中");
+        s.insert(ptrs[5]);
+        check(s.contains(ptrs[5]), "① clear 只清内容、保留容量 → 之后仍可正常插入");
+        for (auto* p : ptrs) delete p;
+    }
+
+    // ── ② GuiBase 的默认政体(纯 m_children):展示接口的地基 ──
+    {
+        struct RawGui : GuiBase {
+            explicit RawGui(GuiBase* parent = nullptr) : GuiBase(parent) {}
+            std::string type() override { return "Raw"; }
+        };
+        RawGui root;
+        auto* c1 = new RawGui(&root);
+        auto* c2 = new RawGui(&root);
+        root.addTreeChild(c1);
+        root.addTreeChild(c2);
+        check(root.visibleChildrenCount() == 2 && root.visibleChild(0) == c1
+              && root.visibleChild(1) == c2 && root.type() == "Raw",
+              "② GuiBase 默认枚举:m_children 顺序直出");
+        check(c1->indexInParent() == 0 && c2->indexInParent() == 1,
+              "② indexInParent:按 m_children 线性查找");
+        check(c2->parentForTree() == &root && c2->parentForTree()->type() == "Raw",
+              "② parentForTree:默认实现读 m_parentForTree");
+        root.updateVisibleChilren();   // 默认实现是空体:三政体下由派生类重写
+        check(root.visibleChildrenCount() == 2, "② updateVisibleChilren 默认空实现不影响枚举");
+        root.removeTreeChild(c1);
+        check(root.visibleChildrenCount() == 1 && root.visibleChild(0) == c2
+              && c1->indexInParent() == -1,
+              "② removeTreeChild 只摘不删;摘掉后 indexInParent 返回 -1");
+        delete c1;                 // 所有权在调用方(removeTreeChild 的契约)
+        RawGui orphan;
+        check(orphan.parentForTree() == nullptr && orphan.indexInParent() == -1,
+              "② 无父亲的节点:parentForTree=nullptr、indexInParent=-1");
+        // root 析构时连坐删除 c2(不可观测,但这条路径必须被执行到 —— ~GuiBase 的循环)
+    }
+
+    // ── ③ 外部消费方才会走的展示接口 + registerRoot 守卫 ──
+    //   这些行引擎内部不调(引擎走窄接口),但它们是 GuiBase 契约的一部分 ——
+    //   内网若有别的消费方(比如自绘树、导出器)就会用到,所以必须被验证过。
+    {
+        auto* root = new NamedData("R27c");
+        auto* leaf = new PartObject("L", "Metal", root);
+        root->addSubDataGroup(leaf);
+        P.registerRoot(root);
+        auto rule = [](GuiBase* n) -> std::optional<GroupTicket> {
+            auto* p = dynamic_cast<PartObject*>(n);
+            if (!p) return std::nullopt;
+            GroupTicket t; t.key = p->material(); t.label = p->material(); return t;
+        };
+        P.install(root, ProjectionSpec{ nullptr, rule, nullptr, { false, true } }, {});
+        (void)P.childCount(root);
+        TreeGroup* g = findGroup(root, "Metal");
+        if (!g) {
+            check(false, "③ 前置:没建出 Metal 组(中止,不许静默跳过)");
+        } else {
+            check(g->type() == "TreeGroup", "③ TreeGroup::type() 对外可辨识");
+            check(g->parentForTree() == root, "③ TreeGroup::parentForTree() = owner(展示父亲提示位)");
+            check(g->visibleChildrenCount() == P.childCount(g) && g->visibleChildrenCount() == 1,
+                  "③ TreeGroup::visibleChildrenCount() 委托引擎,与账本一致");
+            check(g->visibleChild(0) == P.child(g, 0) && g->visibleChild(0) == leaf,
+                  "③ TreeGroup::visibleChild() 同样委托引擎");
+        }
+        check(root->type() == "Data", "③ DataObject::type() 对外可辨识");
+        P.registerRoot(root);          // 重复注册:幂等(内部早返回)
+        P.registerRoot(nullptr);       // 空指针守卫
+        P.unregisterRoot(nullptr);
+        check(P.hasProjection(root), "③ registerRoot 的重复/空指针守卫不崩且不影响投影");
+        P.uninstall(root);
+        P.unregisterRoot(root);
+        P.collectGarbage();
+        clearData(root);
+        delete root;
+    }
+
+    // ── ④ GeomObject:QObject 政体的展示父亲回退 ──
+    {
+        GeomObject g(nullptr, nullptr);
+        check(g.type() == "Geom" && g.parentForTree() == nullptr,
+              "③ GeomObject:type=Geom、无父亲时 parentForTree 回退到 QObject 树(这里为空)");
+        check(g.visibleChildrenCount() == 0, "③ GeomObject 默认无孩子");
+    }
+}
+
 int main() {
-    silenceCrtDialogs();
+#ifdef _MSC_VER
+    silenceCrtDialogs();          // MSVC CRT 专有(MinGW 覆盖率构建下无此 API)
+#endif
 #ifdef Q_OS_WIN
     SetConsoleOutputCP(CP_UTF8);
 #endif
+#ifndef NT_ENGINE_ONLY
     printf("NavTreeGroup unit_tests:25 块,每块打印 职责/输入/输出/校验\n");
+#else
+    printf("NavTreeGroup unit_tests(engine-only):21 块(T15/T16/T18/T19 需 Qt 模型,已排除)\n");
+#endif
     t1_filter();  t2_bucket();  t3_collapse(); t4_reuse(); t5_flat(); t6_sort();
     t7_endToEnd(); t8_cache(); t9_rowOf(); t10_evaporate(); t11_multiLayer(); t12_deathOfOwner();
     t13_prune(); t14_rebind();
+#ifndef NT_ENGINE_ONLY
     t15_model(); t16_signals();
-    t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer(); t20_paranoidAndHeal();
+    t17_readSideRelease(); t18_modelProtocol(); t19_cascadeMultiLayer();
+#else
+    t17_readSideRelease();
+#endif
+    t20_paranoidAndHeal();
     t21_wideReadCost(); t22_bareCoordFreshness(); t23_nodePageCleanup(); t24_shellGroup(); t25_closeMembership();
+    t26_apiSurface(); t27_primitives();
     printf("\n══════ 汇总:%s(失败块数 = %d,即退出码)══════\n",
-           g_fail ? "有 FAIL" : "25 块全绿", g_fail);
+#ifndef NT_ENGINE_ONLY
+           g_fail ? "有 FAIL" : "27 块全绿", g_fail);
+#else
+           g_fail ? "有 FAIL" : "23 块全绿(engine-only)", g_fail);
+#endif
     printf("engine live groups at exit = %d\n", (int)P.liveGroupCount());
     return g_fail ? 1 : 0;
 }

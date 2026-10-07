@@ -105,6 +105,11 @@ public:
     /**
      * @brief 预分配容量(hint 只是"大概要装多少",允许随后继续翻倍)
      * @param [in] expected 预计元素数
+     * @note ★ 2026-10-07 修(由行覆盖率新测试 T27 抓到):旧实现是
+     *       `m_table.assign(capacity, nullptr)` —— 把整张表换成一堆空槽,
+     *       【已插入的元素全部丢失】,而 m_count 原样不动(与表内容脱钩)。
+     *       它一直没爆,只因为唯一调用点是构造函数的"作用于空表"那一处。
+     *       修法:换表后把旧元素【重插】一遍,并让 insert 重新维护 m_count。
      */
     void reserve(size_t expected) {
         size_t needed = expected * 10 / 7 + 1;
@@ -112,9 +117,16 @@ public:
         while (capacity < needed) {
             capacity <<= 1;
         }
-        if (capacity > m_table.size()) {
-            m_table.assign(capacity, nullptr);
-            m_mask = capacity - 1;
+        if (capacity <= m_table.size()) {
+            return;
+        }
+        std::vector<void*> oldTable;
+        oldTable.swap(m_table);
+        m_table.assign(capacity, nullptr);
+        m_mask = capacity - 1;
+        m_count = 0;                                  // 由 insert 重新累加,避免与表内容脱钩
+        for (void* existing : oldTable) {
+            if (existing) insert(existing);           // 容量已按 expected 估好,这里不会再 grow
         }
     }
 

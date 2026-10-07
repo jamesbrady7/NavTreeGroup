@@ -1,5 +1,5 @@
 #include "treeprojection.h"
-#include "pipeline.h"
+#include "projection_stages.h"
 #include <algorithm>
 #include <cstdint>      // SIZE_MAX
 #include <cstdio>       // fprintf(stderr) —— paranoid 漏报点名
@@ -328,7 +328,7 @@ bool TreeProjection::healIfDrift(GuiBase* node, Projection& page, bool verbose) 
 
 // ── revalidate:引擎心脏 = 流水线的【编排器】────────────
 // v4 缓存检查只有一行:干净页零枚举直接返回;脏页重算一次。
-// 各阶段是 pipeline.h 里的纯函数(可独立单测,见 tests.cpp T1~T6);
+// 各阶段是 projection_stages.h 里的纯函数(可独立单测,见 tests.cpp T1~T6);
 // 这里只剩带所有权/引擎状态的事:建组、淘汰组(延迟回收)、写账本、传播置脏。
 void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     // 0. 缓存检查的全部(v3 的纪元闸门/就地比对/双路径全部退役):
@@ -354,7 +354,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     page.lastLive.swap(liveChildren);
 
     // Stage A:过滤(被滤节点移出投影,rowOf=-1;"搜索定位掀开过滤器"是上层职责)
-    std::vector<GuiBase*> visibleNodes = Pipeline::filterLive(page.lastLive, page.spec.filter);
+    std::vector<GuiBase*> visibleNodes = ProjectionStages::filterLive(page.lastLive, page.spec.filter);
 
     // 旧组全单:顶层组 + 成员表里所有层的组(嵌套组也要能被复用/淘汰,否则孤悬泄漏)
     std::vector<TreeGroup*> oldGroups = page.groups;
@@ -443,17 +443,17 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
 
     // Stage B-1/B-2:分桶 + 单组塌缩判定
     size_t participants = 0;
-    auto buckets = Pipeline::bucketByKey(parts,
+    auto buckets = ProjectionStages::bucketByKey(parts,
                                          page.spec.opt.dynamicAll ? nullptr : &page.pool,
                                          page.spec.grouping, participants);
-    if (Pipeline::shouldCollapse(buckets, participants, parts.size(), page.spec.opt)) {
+    if (ProjectionStages::shouldCollapse(buckets, participants, parts.size(), page.spec.opt)) {
         buckets.clear();
     }
 
-    // Stage B-2b:成员关系闭包 —— 剔除"自己的 key 没有桶"的空壳组(纯函数,见 pipeline.h)。
+    // Stage B-2b:成员关系闭包 —— 剔除"自己的 key 没有桶"的空壳组(纯函数,见 projection_stages.h)。
     // 不收敛的后果不只是视图多一个空组行:空壳不在 page.groups 里 → 本函数的淘汰分支
     // 遍历不到它、liveGroupCount() 也数不到它 → 只在 m_groupOwner 里留一条静默泄漏。
-    if (size_t shellCount = Pipeline::closeMembership(buckets); shellCount != 0) {
+    if (size_t shellCount = ProjectionStages::closeMembership(buckets); shellCount != 0) {
 #ifdef _DEBUG
         fprintf(stderr,
                 "[TreeProjection] 规则输出自相矛盾:丢弃了 %zu 个空壳组"
@@ -466,7 +466,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     // 复用旧组(指针稳定 → QModelIndex/展开/选中状态跨重算存活)或新建;
     // 未复用的旧组淘汰(★级联拆其内层投影 + 延迟回收,读侧触发绝不 delete —— 契约 C1)
     std::vector<TreeGroup*> culledGroups;
-    auto reusedGroups = Pipeline::matchReusable(buckets, oldGroups, culledGroups);
+    auto reusedGroups = ProjectionStages::matchReusable(buckets, oldGroups, culledGroups);
     std::map<TreeGroup*, std::vector<GuiBase*>> newMembers;
     for (size_t bucketIdx = 0; bucketIdx < buckets.size(); ++bucketIdx) {
         TreeGroup* bucketGroup = reusedGroups[bucketIdx]
@@ -511,7 +511,7 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     }
 
     // Stage B-4:组内成员排序(与全局同一比较器)
-    Pipeline::sortMembers(newMembers, page.spec.less);
+    ProjectionStages::sortMembers(newMembers, page.spec.less);
 
     // 重建本页成员账本
     page.members = std::move(newMembers);
@@ -546,8 +546,8 @@ void TreeProjection::revalidate(GuiBase* parent, Projection& page) {
     }
     const size_t oldFlatSize = page.flat.size();
     const size_t oldGroupCount = page.groups.size();
-    page.flat = Pipeline::buildFlat(flatParts, page.entries, parent);
-    Pipeline::sortFlat(page.flat, page.spec.less);
+    page.flat = ProjectionStages::buildFlat(flatParts, page.entries, parent);
+    ProjectionStages::sortFlat(page.flat, page.spec.less);
 
     // 组账本 = 本层顶层组(flat 里的组)∪ 成员表全部组键(含"作为成员"的嵌套组)。
     // 只记顶层会漏掉嵌套组 → 下轮 matchReusable 认不出它们 → 重算即孤悬。

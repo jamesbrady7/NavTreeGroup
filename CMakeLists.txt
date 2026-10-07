@@ -36,7 +36,7 @@ add_executable(tree_tabs
 target_link_libraries(tree_tabs Qt5::Widgets)
 
 # 单元测试:18 块,每块打印 职责/输入/输出/校验(仅 Core+Test,无窗口,退出码=失败块数)
-# 也是 pipeline.h 各纯函数阶段的活文档
+# 也是 ProjectionStages 各纯函数阶段的活文档
 # ★ T18 用 Qt 自带的 QAbstractItemModelTester 校验模型协议 → 需 Qt5::Test
 add_executable(unit_tests
     tests.cpp

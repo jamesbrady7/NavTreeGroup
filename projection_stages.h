@@ -1,17 +1,25 @@
 #pragma once
 // ═══════════════════════════════════════════════════════════════
-//  Pipeline:投影流水线的纯函数阶段(从 revalidate 抽出,可独立单测)
+//  ProjectionStages:投影的【纯函数阶段】(从引擎 revalidate 抽出)
 // ═══════════════════════════════════════════════════════════════
+//  命名说明(2026-10-07 改名,原名 `Pipeline`,内网反馈该词过泛):
+//    · 这些函数不是"一条通用的流水线",而是【构造一次树投影】的各个步骤
+//      —— 过滤 → 分桶 → 塌缩判定 → 复用匹配 → 组内排序 → 落位 → 全局排序。
+//    · 因此按"领域 + 角色"命名为 `ProjectionStages`:与 TreeProjection 同一家族,
+//      一看就知道"这是投影引擎的一步",而不是某个可复用的通用设施。
+//    · 名字只描述职责,不暗示依赖顺序以外的东西:每个函数都可【单独调用】,
+//      也可单独测试(T1~T6、T25),彼此之间不共享状态。
+//
 //  设计纪律:本文件所有函数【纯】—— 不碰引擎状态、不 new/delete、
 //  不 deref 可疑指针;输入进、输出出,同样输入必得同样输出。
 //  所有权操作(建组/删组/清账)留在引擎 revalidate 里做编排。
 //
 //  数据流(与 docs/设计精讲.md §8 一致):
 //    live ─[filterLive]→ vis ─[bucketByKey]→ buckets ─[shouldCollapse]→
-//    ─[matchReusable]→ 复用/新建/淘汰名单 ─[sortMembers]→ ─[buildFlat]→
-//    flat ─[sortFlat]→ 最终投影序列
+//    ─[closeMembership]→ 成员关系闭合 ─[matchReusable]→ 复用/新建/淘汰名单
+//    ─[sortMembers]→ ─[buildFlat]→ flat ─[sortFlat]→ 最终投影序列
 //
-//  每一块的"输入→输出"实例见 tests.cpp T1~T6(可直接跑 unit_tests 看)。
+//  每一块的"输入→输出"实例见 tests.cpp T1~T6 / T25(可直接跑 unit_tests 看)。
 #include "treeprojection.h"
 #include <algorithm>
 #include <functional>
@@ -20,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace Pipeline {
+namespace ProjectionStages {
 
 using Less = std::function<bool(GuiBase*, GuiBase*)>;
 
@@ -316,4 +324,4 @@ inline void sortFlat(std::vector<GuiBase*>& flat, const Less& less) {
     }
 }
 
-} // namespace Pipeline
+} // namespace ProjectionStages

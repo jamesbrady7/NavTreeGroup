@@ -15,7 +15,7 @@
 > `[实测]` = 跑过命令/探针,有输出证据 · `[读码]` = 只做过源码审读,未独立运行验证
 > · `[论证]` = 只有推理,无实证(必须写出"为什么暂时无法实证")
 >
-> 最后更新:**回收粒度修复(2026-10-07,探针 P4 实证)** —— C3 改写为"两个回收粒度必须匹配
+> 最后更新:**release 分支:测试提速(规模两档)+ `Pipeline`→`ProjectionStages` 改名 + 行覆盖率 94.3%**(2026-10-07)。此前同日:**回收粒度修复(探针 P4 实证)** —— C3 改写为"两个回收粒度必须匹配
 > 坐标作废的范围"(`collectGarbage` 只给 reset 通道 / `collectGarbageSince` 给 removeRows 通道),
 > C2 修订(`discard` 退出"立即释放",改延迟),`NavTreeModel::endRowRemoval` 改为按水位回收;
 > 新增 **T25**(closeMembership 纯函数)与 **P4** 探针。此前同日:**空壳组修复 + 对接契约修正** ——
@@ -34,7 +34,7 @@
 |---|---|
 | 目标 | 把数据侧三政体原始树,"惰性投影"成带分组/过滤/排序的展示树 |
 | 语言/工具链 | C++17 · MSVC(VS2019, 14.29) · Qt 5.15.2 msvc2019_64 · CMake ≥3.16 VS 生成器 |
-| 源码规模 | 非 build 文件 28 个;引擎核心 4 个文件(treeprojection.h/.cpp、pipeline.h、ptrset.h) |
+| 源码规模 | 非 build 文件 28 个;引擎核心 4 个文件(treeprojection.h/.cpp、projection_stages.h、ptrset.h) |
 | 构建产物 | 7 个可执行:`navtree_demo` `gui_demo` `tree_tabs` `unit_tests` `interactive_demo` `bench` `probe_review`(评审探针) |
 | **不做 add_library** | 决策:内网**直接集成源码**,不抽静态库。(本项已定,勿再提议) |
 | 集成硬依赖 | `unit_tests` **需要 Qt5::Test**(T18 用了 `QAbstractItemModelTester`);其余 5 个目标只依赖 Core(2 个 GUI 目标额外 Widgets) |
@@ -54,7 +54,8 @@ D:\CMAKE\bin\cmake.exe --build "$P\build" --config Debug
 & "$P\build\Release\gui_demo.exe"
 & "$P\build\Release\tree_tabs.exe" --selftest
 & "$P\build\Release\interactive_demo.exe" --selftest
-& "$P\build\Release\bench.exe"                      # 约 3 s
+& "$P\build\Release\bench.exe"                      # 快档(默认):形状不变、规模缩小,< 1 s
+& "$P\build\Release\bench.exe" full                 # ★原规模(1,010,101 节点):§3 的绝对读数出自这一档,约 1 min
 & "$P\build\Release\bench.exe" deep                 # 10 万深链,进程隔离
 & "$P\build\Release\bench.exe" dbg
 & "$P\build\Release\bench.exe" cold,prune    # ★依赖账本的场景必须带 cold 前缀,见下
@@ -390,6 +391,14 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 ## 3. 性能与内存基线
 
+> ⚠ **本节所有绝对读数都出自 `bench full`(原规模 1,010,101 节点)。**
+> 2026-10-07 release 分支起,`bench` **默认跑快档**(形状完全不变、规模缩小到 5,111 节点
+> / 110 页),目的是让整套回归的墙钟从 Release 58 s / Debug 321 s 降到 **Release 1.7 s /
+> Debug 7.7 s(七目标合计)**;快档只打印按比例缩小的账本条目数,**不要拿快档的输出对本文的表**。
+> 换档命令:`bench full`(全场景原规模)/ `bench full,cold,mem`(原规模 + 单场景)。
+> 断言纪律随之收紧:**bench 里不许写死节点数**,一律用 `g_scale` 派生量 ——
+> 两档共用同一套 CHECK,写死即换档变红。
+
 > 机器:验证方本机(Release)。**换机器请重新采基线,不要把绝对值当回归阈值**,
 > 而应看同一台机上的相对变化。
 
@@ -494,19 +503,70 @@ TreeProjection::instance().setEpochOptimization(false);   // 退回"每次都重
 
 | 目标 | 期望 | 实测(Release / Debug) |
 |---|---|---|
-| `unit_tests` | 退出码 = 失败块数 = 0 | **25 块全绿,双配置**(2026-10-07:新增 **T24 空壳组** —— 用"归属表条目数 == 活组数"这个恒等式抓出"活着却不归任何页管"的静默泄漏,修复前 3 条 FAIL 作分辨力;新增 **T25 closeMembership 纯函数** —— 四类边界,其中"多层依赖"是为"把迭代改成单轮过滤"准备的红靶子;此前 2026-10-06 评审轮新增 T22 裸坐标新鲜度 / T23 entries 随页清理;T21 阈值分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
+| `unit_tests` | 退出码 = 失败块数 = 0 | **27 块全绿,双配置**(2026-10-07:新增 **T24 空壳组** —— 用"归属表条目数 == 活组数"这个恒等式抓出"活着却不归任何页管"的静默泄漏,修复前 3 条 FAIL 作分辨力;新增 **T25 closeMembership 纯函数** —— 四类边界,其中"多层依赖"是为"把迭代改成单轮过滤"准备的红靶子;此前 2026-10-06 评审轮新增 T22 裸坐标新鲜度 / T23 entries 随页清理;T21 阈值分配置,见 §7 评审记录);`live groups at exit = 0`。⚠ Debug 版已静音 CRT 弹框,跑测试不应再弹窗 |
 | `navtree_demo` | 退出码 0,不变量通过 | ✔ 通过 |
 | `gui_demo` | 退出码 0 | ✔ 模型不变量 13 项 + 终检 10 项 |
 | `tree_tabs --selftest` | `selftest PASS` | ✔ |
 | `interactive_demo --selftest` | `selftest PASS` | ✔ **62 条 [OK] 全绿**(A~S;v4 迁移后,Q 电池改走通知契约,断言主体不变) |
-| `bench` | `CHECK` 全 OK、teardown 零泄漏 | ✔ CHECK 失败=0 |
+| `bench`(默认=快档) | `CHECK` 全 OK、teardown 零泄漏 | ✔ CHECK 失败=0,**墙钟 < 1 s**(2026-10-07 起;改档前 Release 58 s / Debug 321 s) |
+| `bench full`(原规模) | `CHECK` 全 OK | ✔ CHECK 失败=0,**墙钟 ~57 s**;§3 表里的绝对读数全部出自这一档(账本 108.6 MB / 100000 组 / 9.2 MB 峰值 —— 已逐项复现) |
 | `bench deep` | PASS(无栈溢出) | ✔ depth 100000 |
 | `bench dbg` | 无 MISSING | ✔(注意:其"address reuse"统计的是**叶子**地址复用,与组回收无关) |
-| `bench cold,regroup` | CHECK 全 OK | ✔ 换规则 ~700 ms / 待回收峰值 100000 组 ≈ 9.2 MB / 回收 3.6 ms / 规则可复原。**单跑 `bench regroup` 故意 exit=1**(缺前置,见 §0) |
+| `bench full,cold,regroup` | CHECK 全 OK | ✔ 换规则 ~742 ms / 待回收峰值 **100000 组 ≈ 9.2 MB** / 新存活 10100 组 / 规则可复原。⚠ 这组数字是**原规模**的,必须带 `full`;快档下按比例缩小(1000 组 ≈ 0.1 MB)。**单跑 `bench regroup` 故意 exit=1**(缺前置,见 §0) |
 | `bench gcstress` | 残留=0、无堆损坏、无累积泄漏 | ✔ Debug:200 轮(100 轮走 prune 野 key 路径)堆校验 **0 失败**;Release:`[SKIP]` 堆校验、WS +3.0 MB。详见 §5「ASan 替代实证」 |
 | `bench cold,<场景>` × 9 | exit=0 | ✔ 依赖账本的 9 个场景(`hot/query/model/incr/rebuild/prune/iloop/mem/regroup`)必须带 `cold` 前缀 |
 | `bench <场景>` × 9(单跑) | **故意 exit=1** | ✔ 缺前置 = 测量无效,显式判失败(旧行为是静默给 0 + exit 0,那才是 bug) |
 | `probe_review` | `summary: 0 confirmed` | ✔ 四个探针全 OK:P1 通知契约两半 / P2 entries 随页 / P3 组上零求值(V4 前身 R1/R2/R3,2026-10-06 评审轮)+ **P4 退役组 vs 视图 persistent index**(2026-10-07)。P4 两段判据:**P4a** removeRows 窗口不得释放"未被本次信号覆盖"的更早残留;**P4b** reset 通道必须"既释放(retired=0)、又已作废坐标(held.isValid=0)"。**修复前 P4 CONFIRMED**(实测 retired 1→0 而 held 仍有效),修复后两段皆 OK |
+
+### 行覆盖率(2026-10-07 release 分支新增)`[实测]`
+
+**命令(可复跑,零额外依赖):**
+
+```bash
+python tools/coverage/run_coverage.py      # 退出码 0 = 测试全绿 且 覆盖率 ≥ 85%
+```
+
+**实测结果:引擎行覆盖率 94.3%**(可执行行 796/844)。
+
+| 文件 | 覆盖 / 可执行 | |
+|---|---|---|
+| `treeprojection.cpp` | 517 / 555 | 93.2% |
+| `treeprojection.h` | 39 / 41 | 95.1% |
+| `projection_stages.h` | 113 / 116 | 97.4% |
+| `ptrset.h` | 68 / 70 | 97.1% |
+| `guibase.h` | 59 / 61 | 96.7% |
+| `itreesource.h` | 0 / 1 | 纯虚析构,不可调用(不是缺口) |
+| **小计** | **796 / 844** | **94.3%** |
+| `navtreemodel.h` | — | **本机不可插桩**(需真实 Qt 运行库);其行为由 MSVC 侧 T15/T16/T18/T19 覆盖 |
+| `demonodes.h`(测试夹具,不计入) | 42 / 50 | 84.0% |
+
+**为什么是 MinGW g++ 而不是 MSVC**:本机 VS2019 只装了 `clang-format`/`clang-tidy`
+(**没有** clang-cl),也没有 OpenCppCoverage,而 `cl.exe` 本身不给行覆盖率;
+Qt 自带的 MinGW g++ 13.1 + gcov 是完整可用的 —— 且**引擎与 Qt 运行库无关**,
+所以能把 `tests.cpp` 编成 `NT_ENGINE_ONLY` 变体做真测量。脚本里有两个必须做对的机关:
+① **假 `QObject`**(`tools/coverage/QObject` 靠 `-I` 顺序遮蔽 `<QObject>`):`guibase.h` 里
+`GeomObject` 继承 `QObject`,而引擎不碰 Qt 实现 → 用替身即可编译三政体代码,**交付代码一行不改**;
+② **跨 TU 合并**:pipeline 的 inline 函数会被链接器 COMDAT 去重只留一份,单看某个 `.gcno`
+会得到"0 行执行"的假象 → 脚本把两个 TU 的 gcov 结果**逐行取并集**。
+
+**剩余 48 行的性质(已逐条核对,不是"不知道"):**
+- **退出期测量假象(12 行)**:`~TreeProjection` 的整个函数体 —— 它在进程退出时执行,
+  而 MinGW 的 gcov flush 排在 atexit 链之前,计数写不进去(该路径**每次都跑到**了,
+  只是量不到;试过 `-fno-use-cxa-atexit` 无效,已撤)。
+- **按设计不可达(5 行)**:`revalidate` 里 `groupsKeptAsMember` 白名单(同 key 重复旧组那条
+  病态路径)、`parts` 拼装末尾的兜底 while —— 两者都在源码注释里写明"结构上不可达"。
+- **防御性分支(约 24 行)**:`PtrSet` 成环守卫、`collectReachable` 的 `continue`、
+  `locate`/`rowOf` 的"被过滤/页已拆"回退等 —— 需要构造病态数据才能进,收益低于成本。
+- **1 行**:`ITreeSource` 的纯虚析构。
+
+**覆盖率工作直接换来的两个真实修复**(不是为了让数字好看):
+1. **`PtrSet::reserve` 静默丢数据**(`ptrset.h`):旧实现 `m_table.assign(capacity, nullptr)`
+   把整张表换成空槽却**不重插已有元素**,`m_count` 还与表内容脱钩 —— 因为唯一调用点是
+   构造函数的"作用于空表"那一处,所以一直没爆。T27 抓到并修。
+2. **测试电池从未碰过的接口面**:`apply` / `refresh` / `install(nullptr)` /
+   静态 `pool`(siblings)/ `invalidateNode` / `invalidateAll` / `collectGarbageSince` /
+   宽亲(>256)槽位表 / 塌缩清桶 / `healIfDrift` 的早退与**等长内容漂移** ——
+   现在由 **T26** 与 **T27** 覆盖(见 §4 表)。
 
 ### bench 的 CHECK 退出码契约(2026-10-05 新增,踩坑换来的)
 
@@ -658,9 +718,10 @@ gcstress-x200  200 轮(含 prune 剪枝路径 100 轮) | 残留待回收累计=0
 | **2026-10-06(第三方评审:入网前检视,发现并修复 R1/R2/R3)** | 评审方独立复验(clean build 双配置 0 错误 0 警告;15 项回归 exit 全 0;日志无 FAIL/CHECK!/MISMATCH)+ 写探针 `probe_review.cpp` 实证三个读码疑点。**坐实并修复三处**:① **R1(高危,正确性)**:`parentOf`/`rowOf` 的位置索引快路径在 `EpochScope` 之前执行 → 裸调用不递增纪元 → 快路径内 revalidate 把"上一操作校验过"误当"本操作校验过",数据侧静默变更后返回**陈旧坐标**(探针实证:删 L1 后裸 `rowOf(L3)` 答 1,真值 0)。生产触发面:连续多次精准删除之间无 rowCount 调用时,`beginRemoveRows` 拿到含死者的旧行号(gui_demo 因 Op 间有 dumpModel 而从未暴露)。修复 = 纪元在快路径前开(每操作首触页必重枚举,同操作内仍 O(1))。代价:`parentOf+rowOf` 959→**1342 ns/op**(旧值靠不健全跳过,作废);T21 Debug 诚实成本 ~13 s → **阈值改分配置**(Release 2 s/Debug 30 s,护栏仍能抓 ×600 的真爆炸)。② **R2(中危,内存)**:`dropProjection` 的 `m_nodePage` 清理键集收的是 flat+members 的**组键**(kv.first),漏掉各组成员(kv.second)→ 探针实证 6 条只清 2 条;答案正确性靠快路径查空回退兜底,但条目随组变更单调积累。修复 = 清理直接遍历 `memberToPos` 键集(与登记循环对称同源,不可能再漂移)。③ **R3(低危,契约字面)**:`walkBindings` 条件 `b.locate(n) && (maybeGroup ? !isGroup(n) : true)` 会对组节点**求值 locate**(探针实证 4 次)——违反不变量#3 的字面承诺,用户 locate 若对组做无防御 cast 即 UB。修复 = 先判非组再求值(位图门控收益保留)。回归固化:新增 **T22**(裸坐标新鲜度,分辨力:去掉 R1 修复必红)/ **T23**(拆页清理,分辨力:换回旧写法必红);`probe_review` 加入构建(第 7 目标)。**修复后全绿**:23 块 × 双配置、七目标回归、probe 0 confirmed、bench all/deep/dbg/gcstress/mem/regroup/cold-prune × 双配置 exit 全 0 | `[实测]` 探针修复前:P1 CONFIRMED(stale 1≠0)/P2 CONFIRMED(2/6)/P3 CONFIRMED(4 次);修复后全 OK |
 | **2026-10-06(验证方补:启动即进压力树 + 形态澄清)** | 用户反馈"没看出是改造后的树"。**澄清:代码本来就是 model–view 形态**(`QTreeView` + `NavTreeModel : QAbstractItemModel`,模型只经 `ITreeSource` 读引擎,回归里有 `QAbstractItemModelTester`)。真正的问题是**压力树要手点按钮才出现**,默认看到的是初始树。修正:①**启动即构造压力树并切到它**(交互态无需点按钮);②控制台改为"显示压力树 / 显示初始树"**视图切换**(模型换 root,引擎同一套);③拆树后自动切回初始树(否则模型挂着已删 root);④主程序收尾补充压力树的政体感知清理;⑤新增 **`--smoke` 冒烟模式**,无头打印"界面此刻该显示什么"并点一次规则按钮 —— 实测 `模型 root = 压力装配体 / 存活组 = 18 / 根层 8 行 / 按钮 9 个`,切按类型后 `存活组 5 / 根层 5 行` | `[实测]` 双配置 **0 错误 0 警告**;六目标 × 双配置 + `--smoke` 全 exit 0;`bench all` × 双配置 `CHECK!=0` |
 
-| **2026-10-07(v4 重构:脏通知契约 —— 用户拍板"放宽使用侧")** | 动机(用户):优化机械堆叠让代码杂乱难懂,进内网后无大模型支持难调试,且跨调用 O(k²) 仍未解决;愿意由使用侧承担"告诉引擎何时脏、哪里脏"的契约。设计与全部决策记录见 **docs/重构v4_脏通知.md**。**删除**(整套"猜数据变没变"的机械):纪元闸门(EpochScope/checkedAt/setEpochOptimization/跨线程检测)、liveMatchesLast 就地比对、全局 m_nodePage、每页 memberToPos、提示位图 m_pageHint/m_groupHint(C8 作废)。**新增**:①通知 API `invalidate/invalidateNode/notifyRemove/invalidateAll`(O(1) 置脏,批量天然合并);②每页 `dirty` 标志 —— 缓存检查塌缩成一行 `if (p.valid && !p.dirty) return;`;③单表 `entries`(node→{投影父亲,行号},合并 memberToGroup+memberToPos,随页同生共死 → R2 类泄漏结构上不可能);④`locate()` 统一下钻(parentOf/rowOf 共用);⑤三层漏通知兜底:prune/rebind 自愈(healIfDrift,双配置)+ paranoid 漏报点名(默认 Debug,`setParanoidChecks`,**只对干净页比对** —— 首版把已通知的脏页也点名,9 条误报,已修)+ structRev。**保留**:m_retired/collectGarbage(C1)、structRev(C9)、PtrSet、bindGen 豁免(简化为"同绑定→跳过")、pipeline 七纯函数(buildFlat 改收 entries+owner)、组页自拆回查防护、异常安全闸门(valid 末尾置位,重算开始即撤销)。**迁移**:tests(T5/T8/T10/T16~T23;T20 换"漏报自愈"、T22 换"通知即新鲜"、T23 换 entries;新增"DataObject 构造不自动挂父"踩坑注释)、五 demo(收口点:createAndAttach/deleteChildRaw 包装自动通知;removeWithSignal/t5Remove 插 notifyRemove;S4/S8/Q 电池按新契约改写)、bench(incremental/dbg/gcstress 补通知;rebuild 通道**刻意保持静默**以压测 prune 自愈路径)、probe_review(三探针按 v4 契约重写,含"违约→陈旧→prune 自愈"负面验证)。**已知口径**:verifyGroups"应有组"在多层嵌套下按注册表计数,外层吞内层时顶层组数更小(M 电池"应有2 实际1"日志 v3 时代即如此,非失败,已加注释);prune-1M 113→202ms 是自愈比对的故意成本 | `[实测]` **七目标×双配置 exit 全 0、0 警告**;unit_tests 23 块×双配置;interactive 62 [OK]+--smoke;bench 全模式(all/deep/dbg/gcstress/cold,mem/cold,regroup/cold,prune)×双配置 CHECK=0;probe 0 confirmed(P1a 通知即新鲜/P1b 违约自愈/P2 entries 随页/P3 组上零求值);性能:rowcount 6.3×、wide-rowOf 3000×、model-dfs 2.6×、账本 −52%、跨调用 O(k²) 根除(T21 Debug 13s→1.06ms),对比表见 §3 |
+| **2026-10-07(v4 重构:脏通知契约 —— 用户拍板"放宽使用侧")** | 动机(用户):优化机械堆叠让代码杂乱难懂,进内网后无大模型支持难调试,且跨调用 O(k²) 仍未解决;愿意由使用侧承担"告诉引擎何时脏、哪里脏"的契约。设计与全部决策记录见 **docs/重构v4_脏通知.md**。**删除**(整套"猜数据变没变"的机械):纪元闸门(EpochScope/checkedAt/setEpochOptimization/跨线程检测)、liveMatchesLast 就地比对、全局 m_nodePage、每页 memberToPos、提示位图 m_pageHint/m_groupHint(C8 作废)。**新增**:①通知 API `invalidate/invalidateNode/notifyRemove/invalidateAll`(O(1) 置脏,批量天然合并);②每页 `dirty` 标志 —— 缓存检查塌缩成一行 `if (p.valid && !p.dirty) return;`;③单表 `entries`(node→{投影父亲,行号},合并 memberToGroup+memberToPos,随页同生共死 → R2 类泄漏结构上不可能);④`locate()` 统一下钻(parentOf/rowOf 共用);⑤三层漏通知兜底:prune/rebind 自愈(healIfDrift,双配置)+ paranoid 漏报点名(默认 Debug,`setParanoidChecks`,**只对干净页比对** —— 首版把已通知的脏页也点名,9 条误报,已修)+ structRev。**保留**:m_retired/collectGarbage(C1)、structRev(C9)、PtrSet、bindGen 豁免(简化为"同绑定→跳过")、ProjectionStages 七纯函数(buildFlat 改收 entries+owner)、组页自拆回查防护、异常安全闸门(valid 末尾置位,重算开始即撤销)。**迁移**:tests(T5/T8/T10/T16~T23;T20 换"漏报自愈"、T22 换"通知即新鲜"、T23 换 entries;新增"DataObject 构造不自动挂父"踩坑注释)、五 demo(收口点:createAndAttach/deleteChildRaw 包装自动通知;removeWithSignal/t5Remove 插 notifyRemove;S4/S8/Q 电池按新契约改写)、bench(incremental/dbg/gcstress 补通知;rebuild 通道**刻意保持静默**以压测 prune 自愈路径)、probe_review(三探针按 v4 契约重写,含"违约→陈旧→prune 自愈"负面验证)。**已知口径**:verifyGroups"应有组"在多层嵌套下按注册表计数,外层吞内层时顶层组数更小(M 电池"应有2 实际1"日志 v3 时代即如此,非失败,已加注释);prune-1M 113→202ms 是自愈比对的故意成本 | `[实测]` **七目标×双配置 exit 全 0、0 警告**;unit_tests 23 块×双配置;interactive 62 [OK]+--smoke;bench 全模式(all/deep/dbg/gcstress/cold,mem/cold,regroup/cold,prune)×双配置 CHECK=0;probe 0 confirmed(P1a 通知即新鲜/P1b 违约自愈/P2 entries 随页/P3 组上零求值);性能:rowcount 6.3×、wide-rowOf 3000×、model-dfs 2.6×、账本 −52%、跨调用 O(k²) 根除(T21 Debug 13s→1.06ms),对比表见 §3 |
 | **2026-10-07(用户现场 bug:解除一个工厂组,整页组全灭)** | 诊断:**非引擎、非 Qt 视图** —— demo 层语义缺口。压力树"大平铺件"的 10 个材料组由 installRuleWalk 的工厂规则安装,不在 g_manual 登记;右键"删除组"(onDeleteGroup)只认手动登记 → erase 空转 → installGrouping 见"空登记"→ **uninstall 整页** → 10 组陪葬。修复(demo 层):① `g_dissolved`(owner 名 → 已解散 key 集)—— **工厂组解散 = 规则层排除**(组是规则产物,引擎没有"删单个组"概念,生产同此);② `composeSpec(owner)` 唯一合成点 = 手动规则(优先,不豁免组)+ 工厂规则 + 排除表,顺手修掉两个连带暗坑(工厂页上手动建组顶掉工厂组、onRebuild 工厂页重建后工厂组丢失);③ installGrouping v2:只有"无手动且无工厂"才 uninstall;④ 排除表按【名字】记 → 跨单父重建不复活,整棵压力树重装(installStressProjection)时清零保电池确定性。**修复中抓到的新坑(留痕)**:installRuleWalk 全树共享 `stressRuleFor(树根)` —— 所有页的组 key 前缀是【根名】("压力装配体/Steel"),不是页名;composeSpec 第一版用 stressRuleFor(owner) 合成出"页名/Steel",与在装页的 key 对不上 → 排除永远查不中(实测 10→10)。★ 教训:**合成规则必须与实装规则逐字节同源,前缀这种"看起来是页内实现细节"的东西就是同一性本身**。回归:R 电池新增 3 断言(10→9 其余无损 / 成员回落直属 / 解散态跨单父重建存活+其余 9 组重生) | `[实测]` interactive --selftest 双配置 PASS(66 [OK])、--smoke、unit_tests、probe_review 全 exit 0;双配置 0 错误 0 警告 |
-| **2026-10-07(代码格式规范化:引擎六文件)** | 用户定三条规矩,引擎核心全部对齐:① **头文件函数注释统一 Doxygen**(`@brief/@param [in|out]/@return`,范本=revalidate/rawChildren 用户手改样式),覆盖 treeprojection.h / pipeline.h / ptrset.h / itreesource.h / navtreemodel.h 全部函数;② **所有 if/while/for 一律换行加大括号**(含单语句 return/continue,范本=revalidate 函数体),消灭"一行挤三条"的读码地雷;③ **无语义变量全部更名**:p→page、kv→pageEntry/memberEntry、pit→pageIt、oit→ownerIt、mit→membersIt、git→groupPageIt、eit→posIt、n→node、g→group、c→child、mem→memberList、b→binding、vis→visibleNodes、oldAll→oldGroups、culled→culledGroups、deleted→removedGroups、stale→stalePages 等(cpp 注释按用户要求原样保留,仅同步注释里引用的变量名)。范围=引擎六文件(treeprojection.h/.cpp、pipeline.h、ptrset.h、itreesource.h、navtreemodel.h);demo/tests/bench 未动。**纯格式与命名,零语义变化** | `[实测]` 双配置 clean build **0 错误 0 警告**;回归 12 项(Release:unit/nav/gui/tabs/inter/probe/bench + Debug:unit/inter/gui/tabs/nav)exit 全 0 |
+| **2026-10-07(代码格式规范化:引擎六文件)** | 用户定三条规矩,引擎核心全部对齐:① **头文件函数注释统一 Doxygen**(`@brief/@param [in|out]/@return`,范本=revalidate/rawChildren 用户手改样式),覆盖 treeprojection.h / projection_stages.h / ptrset.h / itreesource.h / navtreemodel.h 全部函数;② **所有 if/while/for 一律换行加大括号**(含单语句 return/continue,范本=revalidate 函数体),消灭"一行挤三条"的读码地雷;③ **无语义变量全部更名**:p→page、kv→pageEntry/memberEntry、pit→pageIt、oit→ownerIt、mit→membersIt、git→groupPageIt、eit→posIt、n→node、g→group、c→child、mem→memberList、b→binding、vis→visibleNodes、oldAll→oldGroups、culled→culledGroups、deleted→removedGroups、stale→stalePages 等(cpp 注释按用户要求原样保留,仅同步注释里引用的变量名)。范围=引擎六文件(treeprojection.h/.cpp、projection_stages.h、ptrset.h、itreesource.h、navtreemodel.h);demo/tests/bench 未动。**纯格式与命名,零语义变化** | `[实测]` 双配置 clean build **0 错误 0 警告**;回归 12 项(Release:unit/nav/gui/tabs/inter/probe/bench + Debug:unit/inter/gui/tabs/nav)exit 全 0 |
 | **2026-10-07(用户现场 bug:删一个组,其它组展开状态全被重置为展开)** | 诊断:**非引擎、非 Qt 缺陷,是 demo 视图层两处行为叠加** —— ① `endResetModel` 的 Qt 语义就是"所有 index 失效、视图丢弃全部展开状态"(生产"更新→reset"通道同样会遇到);② 旧 `structuralReset` 随后**无条件 `expandAll()`**,把手动折叠过的组也强行拉开。引擎侧恰恰是为保状态设计过的:`matchReusable` 按 key 复用旧 TreeGroup 指针(同 key 组跨重算指针稳定)+ C1 延迟回收保证 reset 括号内旧指针内存有效 —— 展开状态**有得保**,只是没被消费。修复(视图层标准配方):reset 前模型遍历收集展开节点【指针集合】→ reset 后遍历活投影树,只对"活树 ∩ 之前展开"恢复 `setExpanded(true)`,新节点默认折叠;删除无条件 expandAll(仅保留 视图初次切换/手动"展开全部"按钮/onRebuild 三处刻意全展开语义)。已知良性瑕疵:退役组地址被新组复用时会多展开一次(纯外观);生产要零误认改用业务 key 做恢复键,套路相同 | `[实测]` interactive --selftest 双配置 PASS、--smoke 通过、0 错误 0 警告 |
 | **2026-10-07(空壳组修复 + 对接契约修正)** | ① **引擎修**:新增纯函数 `Pipeline::closeMembership`(Stage B-2b,迭代到不动点)—— 剔除"自己的 key 没有桶"的空壳组 + 丢掉随之变空的桶;`revalidate` 调用它,Debug 下 stderr 点名"规则输出自相矛盾"。起因:多层分组下"内层组失去全部成员,却仍被外层组按名字收着"→ 零成员空壳组。**真正的伤害不是多一个空行**:空壳只是 members 的 value、不是 key ⇒ 不在 `page.groups` ⇒ `dropProjection`/`uninstall`/`liveGroupCount()` 全部遍历不到它 ⇒ **静默泄漏**(实测 `uninstall` 后 `liveGroupCount()=0` 而归属表残留 1)。② **测试**:新增 **T24**(24 块),判据是恒等式 `memoryBreakdown().groupOwner == liveGroupCount()`;修复前 **3 条 FAIL**(实测"活组1/归属2""uninstall 后 0/1")⇒ 有分辨力;测试还当场抓出作者自己的场景 bug(漏给 C 出票)。③ **demo 根治**:`onDeleteGroup` 补"删除侧"引用清理 —— 把该组 label 从其它手动组成员名单里摘掉、并丢掉被摘空的登记(与 `doGroup` 建组时的"从其它组摘名字"对称;只做增侧清理 = 规则会输出自相矛盾的票)。④ **可读性**:`installGrouping` → **`syncPageRule`**(它实为"按当前登记把这一页重新投影一遍"),并补注释说明"删一个组为何走 `install` 而不是 `uninstall`"。⑤ **文档修正**:新增不变量 **#11**(成员表闭合)、C5 补"**属性漂移没有任何兜底**"警告(三层兜底比的都是孩子列表)、§1.5 补异常窗口(§516 换 members 而 §568 才换 groups,中间调用用户 `less`,抛异常即留下同 key 双胞胎 —— **这才是 `groupsKeptAsMember` 必须保留的真理由**,不是"多层存活路径")、§1.1 补通知 API 行、§3 补 paranoid 首发纪律、修掉三处 v4 遗留漂移(§1.5 checkedAt / §2#7 memberToGroup / §4 m_nodePage)。⑥ **bench 拆地雷**:`scenarioIncremental` 的 victims 由有放回抽样改 **`std::sample`**(无放回)—— 旧写法会对同一 leaf 二次 delete,`seed 123` 恰好 0 次重复掩盖了它,换随机 seed 约四成概率会撞。⑦ 同窗口另有两次 interactive 修复(工厂组解散只解散该组 `f624d5f`、结构变更跨 reset 保展开态 `e0a4fed`),详见各自提交 | `[实测]` 七目标 × 双配置 exit 全 0、**0 错误 0 警告**;`unit_tests` **24 块** × 双配置;`interactive --selftest` 66 [OK] PASS;bench 全模式(all/deep/dbg/gcstress/cold,prune/cold,mem/cold,regroup)× 双配置 `CHECK=0`;probe **0 confirmed**;Release bench **TOTAL 2288.9 ms / WS 326 MB / 账本 108.6 MB**(与 §3 基线一致,无回归);新诊断首轮全量回归中**仅在 T24 的设计场景命中一次**,其余 23 块 + 七 demo + bench 零噪声 |
-| **2026-10-07(回收粒度:探针 P4 实证的 release 通道 UAF)** | **发现**:写 P4 探针检验 C1 的防线,在"**守约但不带括号**的调用"路径上**坐实一个 UAF** —— `notifyRemove` 的调用前提本就没有括号要求(§1.1),之后一次纯读触发组蒸发入 `m_retired`;此时**任何一次不相干的精准删除**都会走 `endRowRemoval()` → 整队列 `collectGarbage()` → 把这个"从未被任何信号覆盖过"的组 release 掉。而 `endRemoveRows()` **只作废该 parent 下 `[first,last]` 行的** persistent index ⇒ 视图侧仍认为它有效。**P4 实测**:`retired 1→0`(组确实被释放)而 `held.isValid()==1`(Qt 从没被告知)⇒ `internalPointer` 悬空,之后任何 `rowCount(held)`/展开态检查都是 UAF。**根因不是"忘了通知",是两个回收点与两种坐标作废范围不匹配**(reset 作废全部 / removeRows 只作废范围),而 `collectGarbage()` 一律清整队列。**修复**:① 窄接口新增 `retiredCount()`(水位)+ `collectGarbageSince(mark)`;② `NavTreeModel::beginRowRemoval` 记水位、`endRowRemoval` 只回收本窗口新退役的那一段(reset 通道仍用整队列 `collectGarbage`,因为 `endResetModel` 作废全部坐标);③ **`discard` 改延迟释放**(`deferDelete=true`)—— 它是 `notifyRemove` 的内含步骤而后者不要求括号,当场 delete 组就是同一类 UAF;册页仍立即拆掉(按死亡指针做键,不能留);④ 契约定稿:C2 修订、C3 改写为"两个粒度必须匹配坐标作废范围"、§1.1 表补两行并把调用时机写成"**`end` 之后**"(作废发生在 end 不是 begin)。**新增回归**:`unit_tests` **T25**(`closeMembership` 纯函数:空输入/已闭合/单壳/宿主只剩空壳/多层依赖 —— 最后一条是"改成单轮过滤"的红靶子);`probe_review` **P4**(两段判据:P4a 不得越窗回收、P4b reset 通道必须"既释放又作废坐标")。**分辨力**:修复前 P4 CONFIRMED,修复后 P4a/P4b 皆 OK;T25 的 ④ 在单轮实现下必红 | `[实测]` P4 修复前 `retired 1→0 & held.isValid=1`(CONFIRMED)、修复后 `retired 1→1`(残留留着)与 reset 后 `retired=0 & held.isValid=0`;七目标 × 双配置 exit 全 0、0 错误 0 警告;`unit_tests` **25 块** × 双配置;interactive 66 [OK];bench 全模式 × 双配置 `CHECK=0`;probe **0 confirmed** |
+| **2026-10-07(回收粒度:探针 P4 实证的 release 通道 UAF)** | **发现**:写 P4 探针检验 C1 的防线,在"**守约但不带括号**的调用"路径上**坐实一个 UAF** —— `notifyRemove` 的调用前提本就没有括号要求(§1.1),之后一次纯读触发组蒸发入 `m_retired`;此时**任何一次不相干的精准删除**都会走 `endRowRemoval()` → 整队列 `collectGarbage()` → 把这个"从未被任何信号覆盖过"的组 release 掉。而 `endRemoveRows()` **只作废该 parent 下 `[first,last]` 行的** persistent index ⇒ 视图侧仍认为它有效。**P4 实测**:`retired 1→0`(组确实被释放)而 `held.isValid()==1`(Qt 从没被告知)⇒ `internalPointer` 悬空,之后任何 `rowCount(held)`/展开态检查都是 UAF。**根因不是"忘了通知",是两个回收点与两种坐标作废范围不匹配**(reset 作废全部 / removeRows 只作废范围),而 `collectGarbage()` 一律清整队列。**修复**:① 窄接口新增 `retiredCount()`(水位)+ `collectGarbageSince(mark)`;② `NavTreeModel::beginRowRemoval` 记水位、`endRowRemoval` 只回收本窗口新退役的那一段(reset 通道仍用整队列 `collectGarbage`,因为 `endResetModel` 作废全部坐标);③ **`discard` 改延迟释放**(`deferDelete=true`)—— 它是 `notifyRemove` 的内含步骤而后者不要求括号,当场 delete 组就是同一类 UAF;册页仍立即拆掉(按死亡指针做键,不能留);④ 契约定稿:C2 修订、C3 改写为"两个粒度必须匹配坐标作废范围"、§1.1 表补两行并把调用时机写成"**`end` 之后**"(作废发生在 end 不是 begin)。**新增回归**:`unit_tests` **T25**(`closeMembership` 纯函数:空输入/已闭合/单壳/宿主只剩空壳/多层依赖 —— 最后一条是"改成单轮过滤"的红靶子);`probe_review` **P4**(两段判据:P4a 不得越窗回收、P4b reset 通道必须"既释放又作废坐标")。**分辨力**:修复前 P4 CONFIRMED,修复后 P4a/P4b 皆 OK;T25 的 ④ 在单轮实现下必红 | `[实测]` P4 修复前 `retired 1→0 & held.isValid=1`(CONFIRMED)、修复后 `retired 1→1`(残留留着)与 reset 后 `retired=0 & held.isValid=0`;七目标 × 双配置 exit 全 0、0 错误 0 警告;`unit_tests` **27 块** × 双配置;interactive 66 [OK];bench 全模式 × 双配置 `CHECK=0`;probe **0 confirmed** |
+| **2026-10-07(release 分支:测试提速 / 命名 / 覆盖率)** | 三件事,全部服务于"能交给内网"。① **测试提速**:`bench` 拆**规模两档** —— 默认快档(Shape A 5,111 节点 / 110 页,形状完全不变)、`bench full` 复现 §3 基线原规模(1,010,101 节点)。断言纪律随之收紧:**不许写死节点数**,一律用 `g_scale` 派生量(写死即换档变红)。实测:七目标合计墙钟 **Release 1.70 s / Debug 7.66 s**(改前仅 bench 一项就 58 s / 321 s);`bench full` 仍原样复现 §3 的绝对读数(账本 108.6 MB / 100000 组 / 9.2 MB 峰值),`bench full` 自身 57 s / CHECK=0。快档下"缺前置自检"契约 23 项判定全对(9 依赖 exit=1 / 5 自足 exit=0 / 9 组合 exit=0)。② **改名**:`Pipeline` → **`ProjectionStages`**,文件 `pipeline.h` → **`projection_stages.h`** —— 内网反馈"Pipeline 语义过泛";新名按"领域 + 角色"取,与 `TreeProjection` 同一家族,一看便知是"投影的一步"而非通用设施。③ **行覆盖率(新增可复跑测量)**:`python tools/coverage/run_coverage.py` —— MinGW g++ 13.1 + gcov,靠"假 QObject 遮蔽"+"跨 TU 逐行取并集"两个机关,**交付代码一行不改**。实测引擎 **94.3%**(796/844);`navtreemodel.h` 需真实 Qt 运行库,本机不可插桩(由 MSVC 侧 T15/T16/T18/T19 覆盖)。**覆盖率工作换来两个真实修复**:★ `PtrSet::reserve` 静默丢数据(旧实现换表不重插元素、`m_count` 与表内容脱钩 —— 此前只被构造函数的空表调用掩盖着,已修并钉在 T27);★ 电池从未碰过的接口面(`apply`/`refresh`/静态 pool/`invalidateNode`/`invalidateAll`/`collectGarbageSince`/宽亲槽位表/塌缩清桶/等长内容漂移)现由 **T26/T27** 覆盖(unit_tests **27 块**)。④ 为了让测试能在无 Qt 编译器下构建,`tests.cpp` 加了 `NT_ENGINE_ONLY` 守卫(排除 T15/T16/T18/T19)—— **MSVC 侧行为完全不变**(27 块全绿)。| `[实测]` 七目标 × 双配置 exit 全 0、0 错 0 警;unit_tests **27 块**;interactive 66 [OK];bench 全模式(fast + `full`)CHECK=0;probe 0 confirmed;覆盖率脚本 exit=0(94.3% ≥ 85%) |
