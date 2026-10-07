@@ -221,24 +221,74 @@ struct ManualGroup { std::string key; std::string label; std::vector<std::string
 static std::map<GuiBase*, std::vector<ManualGroup>> g_manual;   // owner(数据父) → 组定义
 static int g_keySeq = 0;
 
-// 由 owner 的手动组定义合成 Spec:规则按【名字】命中 → 稳定,重建后同名节点自动归组
-static ProjectionSpec buildSpec(GuiBase* owner) {
+// ═══════════════ 已解散组登记(工厂组"解除一个"的规则层答案)═══════════════
+// ★ 用户现场 bug(2026-10-07 修):右键"删除组"原来只认手动登记 —— 工厂组
+//   (如压力树 大平铺件 的 10 个材料组)不在登记里,erase 空转 → installGrouping
+//   见"空登记"→ uninstall 整页 → 一页 10 个组全部陪葬。
+//   正确语义:组是【规则的产物】,引擎没有"删单个组"的概念 ——
+//   手动组解散 = 删登记;工厂组解散 = 规则排除(key 进本表,规则出票前查表)。
+// ★ 按【owner 名字】做键(不用指针):工厂组的 key 自带 owner 名字前缀
+//   (stressRuleFor 的纪律),单父重建后 owner 换新地址、同名即同页,排除仍然生效。
+static std::map<std::string, std::set<std::string>> g_dissolved;   // owner 名 → 已解散组 key
+
+// 前向声明(composeSpec 需要"这页原本装没装工厂规则";定义在压力树/工具区)
+static GuiBase* topOf(GuiBase* n);
+static GroupRule stressRuleFor(GuiBase* page);
+static bool hasGroupableInside(GuiBase* n);
+static GuiBase* g_stressRoot = nullptr;       // 压力树主根(定义在此,压力树区不再重复定义)
+static GuiBase* g_stressRoot2 = nullptr;      // 第二棵独立树(多根隔离用)
+
+// owner 是否为"压力树工厂页"的持有者(与 installRuleWalk 的装页条件保持一致;
+// 根页是手动页、控制台"规则按钮"是全局开关,都不算在这里)
+static bool hasFactoryPage(GuiBase* owner) {
+    if (!owner || !g_stressRoot) return false;
+    if (owner == g_stressRoot || owner == g_stressRoot2) return false;
+    GuiBase* t = topOf(owner);
+    if (t != g_stressRoot && t != g_stressRoot2) return false;
+    if (dynamic_cast<MeshObject*>(owner)) return true;    // Mesh 无条件装页(parentOf 锚点)
+    return hasGroupableInside(owner);
+}
+
+// 合成 owner 页的完整 Spec = 手动规则(优先) + 工厂规则 + 已解散排除。
+// ★ 唯一合成点 —— installGrouping / onRebuild(两种方式)全走这里,
+//   同一页上手动组与工厂组【共存】,解除任何一个组都只影响它自己
+//   (旧实现 installGrouping 只装纯手动规则,还有两个连带暗坑:
+//    ① 工厂页上手动建组会把工厂组顶掉;② onRebuild 工厂页重建后工厂组丢失)。
+static ProjectionSpec composeSpec(GuiBase* owner) {
     std::vector<ManualGroup> groups = g_manual[owner];   // 按值捕获名字(不捕指针!)
     // ★ 手动规则【不豁免组】:多层分组靠的就是"组的 label 也在某个手动组的
-    //   成员名单里" → 组作为整体进外层桶。豁免组的是通用工厂规则(byKey/
-    //   byPredicate),不是这里。
-    GroupRule rule = [groups](GuiBase* n) -> std::optional<GroupTicket> {
+    //   成员名单里" → 组作为整体进外层桶。豁免组的是工厂规则(stressRuleFor 自带)。
+    GroupRule manualRule = [groups](GuiBase* n) -> std::optional<GroupTicket> {
         std::string nm = baseName(n);
         for (const auto& g : groups)
             for (const auto& mn : g.memberNames)
                 if (mn == nm) { GroupTicket t; t.key = g.key; t.label = g.label; return t; }
-        return std::nullopt;                             // 不在任何手动组 → 直属
+        return std::nullopt;                             // 不在任何手动组 → 交给工厂规则
+    };
+    // ★ 工厂规则必须与 installRuleWalk 实装的是【同一个】—— 它对整棵树共享
+    //   stressRuleFor(树根),所有页的 key 前缀都是根名(不是页名!)。
+    //   曾错用 stressRuleFor(owner):合成规则产出"页名/材料"key,与在装页的
+    //   "根名/材料"key 对不上 → 解散排除永远查不中(实测 10→10 组不变)。
+    GroupRule factory = hasFactoryPage(owner) ? stressRuleFor(topOf(owner)) : GroupRule{};
+    GroupRule rule = [manualRule, factory](GuiBase* n) -> std::optional<GroupTicket> {
+        std::optional<GroupTicket> t = manualRule(n);    // 手动优先(可收组 → 多层)
+        if (!t && factory) t = factory(n);
+        if (!t) return std::nullopt;
+        // 已解散排除:用【当前数据父的名字】现场查表 —— 不捕获 owner 指针,
+        // 跨全量重建 owner 换新地址也照样命中(同名即同页)
+        if (GuiBase* pg = n->parentForTree()) {
+            auto it = g_dissolved.find(baseName(pg));
+            if (it != g_dissolved.end() && it->second.count(t->key)) return std::nullopt;
+        }
+        return t;
     };
     return ProjectionSpec{ nullptr, rule, demoLess, { false, true /*dynamicAll*/ } };
 }
+
 static void installGrouping(GuiBase* owner) {
-    if (g_manual[owner].empty()) P.uninstall(owner);
-    else P.install(owner, buildSpec(owner));
+    // "既无手动登记、也无工厂规则"才拆整页(旧实现只看手动登记 → 工厂页被误杀)
+    if (g_manual[owner].empty() && !hasFactoryPage(owner)) { P.uninstall(owner); return; }
+    P.install(owner, composeSpec(owner));
 }
 
 // ═══════════════ 子树快照 / 重建(全量重建用) ═══════════════
@@ -304,16 +354,28 @@ static void structuralReset(const std::function<void()>& mutate) {
 }
 
 // ═══════════════ 操作 4:删除组(解散,成员回落直属) ═══════════════
+// ★ 两条解散路径(用户现场 bug 的修复,2026-10-07):
+//   手动组 → 删登记(g_manual);工厂组 → key 进规则排除表(g_dissolved)。
+//   两者最后都走 installGrouping = composeSpec 重装【这一页】——
+//   其它组(手动+工厂)原样保留。旧实现只认手动登记,工厂组进来时
+//   空登记 → uninstall 整页 → 大平铺件 10 个材料组一起消失。
 static void onDeleteGroup(GuiBase* group) {
     auto* g = dynamic_cast<TreeGroup*>(group);
     if (!g) return;
     GuiBase* owner = g->owner();
     std::string key = g->ticket().key, label = g->ticket().label;
     auto& v = g_manual[owner];
-    v.erase(std::remove_if(v.begin(), v.end(),
-        [&](const ManualGroup& m) { return m.key == key; }), v.end());
-    log("删除组 [" + label + "] → 成员回落为直属");
-    structuralReset([&] { installGrouping(owner); });   // 空则 uninstall,否则按剩余组重装
+    auto it = std::remove_if(v.begin(), v.end(),
+        [&](const ManualGroup& m) { return m.key == key; });
+    const bool wasManual = (it != v.end());
+    v.erase(it, v.end());
+    if (!wasManual) {
+        g_dissolved[baseName(owner)].insert(key);   // 工厂组:规则层排除(按 key 记,重建不复活)
+        log("解散工厂组 [" + label + "] → 规则排除(按 key 记,重建不复活);其余组不受影响");
+    } else {
+        log("删除手动组 [" + label + "] → 成员回落为直属");
+    }
+    structuralReset([&] { installGrouping(owner); });   // composeSpec 重装本页(手动+工厂+排除)
 }
 
 // ═══════════════ 删除内核:政体感知摘除 + 清后代 + 清账 ═══════════════
@@ -322,6 +384,7 @@ static void deleteNodeFull(GuiBase* victim) {
     clearDescendants(victim);                // 清后代 + discard(victim) 清其账
     P.discard(victim);                       // 幂等再清一次
     g_manual.erase(victim);                  // 它若当过 owner,丢掉其手动组定义
+    g_dissolved.erase(baseName(victim));     // 同步丢它的"已解散组"排除表
     if (dp) deleteChildRaw(dp, victim);      // 按政体摘除+delete(~GuiBase/~QObject 连坐)
     else delete victim;
     P.prune();                               // 清剩余僵尸账(地址复用幽灵防线)
@@ -474,10 +537,10 @@ static void onRebuild(GuiBase* parent, bool useBindSpec) {
         GuiBase* root = g_root;
         P.bindSpec({ id,
             [pname, root](GuiBase* n) { return baseName(n) == pname && topOf(n) == root; },
-            buildSpec(parent) });                     // bindSpec 内部即 rebind
+            composeSpec(parent) });                   // bindSpec 内部即 rebind;composeSpec=手动+工厂+排除
     } else {                                          // 方式 A:命令式,手动 prune+install
         P.prune();
-        P.install(parent, buildSpec(parent));
+        P.install(parent, composeSpec(parent));       // ★ 曾用 buildSpec(纯手动)→ 工厂页重建后工厂组全丢
     }
     g_model->endFullReset();
     g_view->expandAll();
@@ -524,8 +587,8 @@ static GuiBase* buildInitialTree() {
 //   · 24 个同名材料 key + 组 cull/复用 → 配合"换规则"看延迟释放峰值(C4)
 // ⚠ 深度刻意压到 25:PROJECT.md §3 记过"~GuiBase 连坐析构是递归的,>3 万级爆栈",
 //   24 层安全且足以暴露 O(depth) 类问题。
-static GuiBase* g_stressRoot = nullptr;   // 压力树主根(装投影的那个)
-static GuiBase* g_stressRoot2 = nullptr;  // 第二棵独立树(多根隔离用)
+// g_stressRoot / g_stressRoot2 的定义已上移到"手动分组登记"区
+// (composeSpec/hasFactoryPage 需要它们;C++ 的 static 声明即定义,不能二次定义)
 
 // 递归装同一套工厂规则。
 // ⚠ 两条实测教训(第一版就踩了,别重犯):
@@ -603,6 +666,8 @@ static void installRuleWalk(GuiBase* root, GuiBase* node, const GroupRule& rule,
 //   代价:重建后要再调一次本函数。
 static void installStressProjection() {
     if (!g_stressRoot) return;
+    g_dissolved.clear();   // 整棵压力树(重)装 = 规则状态归零(解散表清空,
+                           // R/S 电池的"10 个材料组"断言因此确定;单父 onRebuild 不清)
     // 预置手动组定义(按名字记成员)—— 给根页用,也是"组套娃 / 同名收组"的把玩入口。
     // ⚠ 手动规则只对 root 的【直接孩子】求值,所以成员名单必须是直接孩子的名字
     //   (实测:写"链末零件"没用 —— 它埋在深层节点以下 21 层,规则扫不到)。
@@ -760,6 +825,7 @@ static void teardownStressTree() {
         P.unbindSpec("stress-manual");
         P.discard(r1);  P.discard(r2);
         g_manual.erase(r1); g_manual.erase(r2);
+        g_dissolved.clear();
     });
     P.unregisterRoot(r1); P.unregisterRoot(r2);
     P.prune();
@@ -1399,6 +1465,37 @@ static int runSelfTest() {
             check(false, "R 前置:空网格不存在(压力树构建有问题)");
         }
 
+        // ── ★工厂组解散(用户现场 bug 回归,2026-10-07)──
+        //   旧实现:右键"删除组"只认手动登记 → 工厂组空转 → installGrouping
+        //   见空登记 uninstall 整页 → 大平铺件 10 个材料组【全部】消失。
+        //   新实现:工厂组解散 = 规则排除(g_dissolved 按 key),只死一个组。
+        {
+            GuiBase* ff = findByName(rs, "大平铺件");
+            TreeGroup* steelG2 = findGroupByLabel(ff, "Steel 件");
+            check(steelG2 != nullptr, "R 前置:大平铺件的 Steel 件组在(解散回归)");
+            if (steelG2) {
+                GuiBase* member0 = P.childCount(steelG2) ? P.child(steelG2, 0) : nullptr;
+                size_t groupsBefore = 0;
+                for (size_t i = 0; i < P.childCount(ff); ++i)
+                    if (P.isGroup(P.child(ff, i))) ++groupsBefore;
+                onDeleteGroup(steelG2);                // 右键"删除组"同款入口
+                size_t groupsAfter = 0;
+                for (size_t i = 0; i < P.childCount(ff); ++i)
+                    if (P.isGroup(P.child(ff, i))) ++groupsAfter;
+                check(groupsBefore == 10 && groupsAfter == 9,
+                      "R ★解散一个工厂组只解散一个(10→9),其余组无损(旧 bug:整页全灭)");
+                check(member0 && P.parentOf(member0) == ff,
+                      "R ★被解散组的成员回落为直属(parentOf=原 owner)");
+                // 解散按 key 记 → 单父重建(手动 prune+install)不复活,其余组照常重生
+                onRebuild(ff, false);
+                size_t groupsRe = 0;
+                for (size_t i = 0; i < P.childCount(ff); ++i)
+                    if (P.isGroup(P.child(ff, i))) ++groupsRe;
+                check(findGroupByLabel(ff, "Steel 件") == nullptr && groupsRe == 9,
+                      "R ★解散状态跨单父重建存活(规则排除按 key 记);其余 9 组正常重生");
+            }
+        }
+
         // ── 交互入口自证:ensureStressTree 幂等 + teardownStressTree 干净收场 ──
         ensureStressTree();                        // 已存在 → 应当幂等,不重复构建
         check(countData(g_stressRoot) == 542,      // 空网格已删,543 → 542
@@ -1580,6 +1677,7 @@ int main(int argc, char** argv) {
         auto* r2 = dynamic_cast<DataObject*>(g_stressRoot2);
         g_stressRoot = g_stressRoot2 = nullptr;
         g_manual.erase(r1); g_manual.erase(r2);
+        g_dissolved.clear();
         P.discard(r1); P.discard(r2);
         P.unregisterRoot(r1); P.unregisterRoot(r2);
         P.prune(); P.collectGarbage();
